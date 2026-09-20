@@ -1,0 +1,74 @@
+name: Intel WhisperKit Spike
+
+# Deliberate opt-in only. No push, pull_request, or scheduled execution.
+on:
+  workflow_dispatch:
+    inputs:
+      approved:
+        description: I approve running this single Intel test now
+        type: boolean
+        required: true
+        default: false
+      compute:
+        description: Test one compute setting (CPU first; GPU is optional)
+        type: choice
+        default: cpu
+        options:
+          - cpu
+          - cpu-gpu
+      model:
+        description: Model to test (Tiny is only a smoke test; Turbo is the app default)
+        type: choice
+        default: openai_whisper-tiny.en
+        options:
+          - openai_whisper-tiny.en
+          - openai_whisper-base.en
+          - openai_whisper-large-v3-v20240930_turbo
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intel-whisperkit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    if: github.repository == 'A54DH/EnviousWispr-Intel' && github.event_name == 'workflow_dispatch' && inputs.approved == true
+    name: Intel / ${{ inputs.compute }}
+    runs-on: macos-15-intel
+    # A safety ceiling for the whole job, not a promised completion time.
+    timeout-minutes: 20
+    env:
+      PROBE_MODEL: ${{ inputs.model }}
+      PROBE_COMPUTE: ${{ inputs.compute }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Assert native Intel runner
+        shell: bash
+        run: |
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -m)" = x86_64
+          test "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" != 1
+      - name: Test diagnostic scoring and error handling
+        run: python3 -m unittest discover -s experiments/intel-whisperkit/tests -v
+      - name: Build, load and transcribe with the app-pinned WhisperKit
+        run: |
+          python3 experiments/intel-whisperkit/run.py \
+            --compute "$PROBE_COMPUTE" \
+            --model "$PROBE_MODEL" \
+            --probe-timeout 600 \
+            --output "experiments/intel-whisperkit/results/$PROBE_COMPUTE"
+      - name: Retain diagnostic evidence even after failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: intel-whisperkit-${{ inputs.compute }}-${{ github.run_attempt }}
+          path: |
+            experiments/intel-whisperkit/results/${{ inputs.compute }}/*.json
+            experiments/intel-whisperkit/results/${{ inputs.compute }}/*.log
+            experiments/intel-whisperkit/results/${{ inputs.compute }}/*.md
+          if-no-files-found: warn
+          retention-days: 3

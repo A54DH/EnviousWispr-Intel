@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+.cache/
+results/
+Package.resolved
+__pycache__/
