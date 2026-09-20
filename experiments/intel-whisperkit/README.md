@@ -5,6 +5,24 @@ exact WhisperKit dependency can build and transcribe a known recording on native
 Intel macOS. It does not modify the app, its lockfile, release architecture,
 helpers, signing, update feed, or model defaults.
 
+## Current status and next step
+
+**Keep repository Actions disabled and leave this PR unmerged.** The owner has
+requested no further Actions execution without explicit approval.
+
+The first run produced two different outcomes, not two Intel inference failures:
+
+- CPU-only: dependency download failed because the runner could not connect to GitHub.
+  The engine was never built or exercised in that job.
+- CPU/GPU: the Intel executable built and the Tiny English model loaded. The process
+  then exited with signal 11 during its first transcription. There is no completed
+  transcript or saved stack trace establishing the root cause.
+
+See [the evidence review](RESULTS-2026-09-20.md). No crash fix is claimed.
+The next useful experiment is **one CPU-only test**, preferably on the intended
+physical Mac after checking its macOS, memory, and Xcode/toolchain. Do not automatically
+repeat the GPU run or expand the model matrix.
+
 ## What runs
 
 The separate Swift package reads `../../Package.resolved` and pins Argmax and its
@@ -18,7 +36,7 @@ Its Git blob identity is checked (`3184d372cd2f8b804d3a540c70ec50d927b335d2`) an
 SHA-256 recorded. The reference transcript is used **only for scoring afterward**;
 it is never included in the recognition prompt. No microphone or personal audio is used.
 
-The probe requests CPU-only and CPU/GPU compute in separate jobs, never Neural Engine.
+One invocation requests either CPU-only or CPU/GPU compute, never Neural Engine.
 It records model-download and model-load time, then performs three transcriptions:
 one first-in-process inference and two warmed repeats. Each includes the audio-file
 conversion cost. The load measurement may include tokenizer downloads. These are not
@@ -30,45 +48,51 @@ quality claim. Latency is measured, not gated. Real-time factor (RTF) is elapsed
 processing time divided by audio duration; below 1 means faster than real time for
 this recording. It does not mean instant paste after recording stops.
 
-## Run on GitHub
+## GitHub Actions: manual opt-in only
 
-The `Intel WhisperKit Spike` workflow runs on pushes to `intel-spike`, on the explicit
-`macos-15-intel` runner. It rejects ARM64 and Rosetta rather than silently testing a
-different architecture. Jobs have read-only repository access, no secrets, and do
-not deploy, sign, release, or update anything. Model downloads use public upstream
-endpoints. Diagnostics are retained for 14 days; model weights and audio are not uploaded.
+The experiment workflow now has **only `workflow_dispatch`**, with an explicit
+`approved` input defaulting to false. There is no push, PR, or schedule trigger and
+no two-job matrix. One approved invocation runs one selected compute setting; the
+default is CPU-only with Tiny English. The job is capped at 20 minutes, with a
+600-second probe limit. These are safety ceilings, not performance targets.
+A whole-job timeout may prevent artifact upload; inspect the job log in that case.
 
-Forks can initially have Actions disabled. If no run appears, open the fork's Actions
-tab and enable workflows. A subsequent push to this branch then triggers the probe.
-`workflow_dispatch` becomes available in the UI once the workflow exists on the default
-branch; merely opening this PR does not make that button appear. Do not merge it only
-for that reason: the push trigger works while the experiment remains unmerged.
+This changes only the experiment workflow on `intel-spike`. The fork still contains
+inherited upstream workflows, including the broad PR check. **Do not re-enable all
+Actions merely to expose the manual button.** Those other workflows would need to be
+reviewed or disabled separately first. The repository-wide disabled setting remains
+the immediate safeguard. Future commits should also use `[skip ci]` while paused.
 
-The default model is **Tiny English**, not the app's much larger Turbo model. A Tiny
-pass only establishes an engine foothold. After the initial result, test Base English
-and the actual Turbo model before deciding on the application port. The manual workflow
-input supports these when dispatch is available; local commands are below.
+GitHub requires a `workflow_dispatch` workflow to be on the default branch before
+manual dispatch is available. Do not merge this draft just to make that button appear.
+Reference: https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow
 
-## Run on a physical Intel Mac
+The workflow uses the explicit `macos-15-intel` runner and rejects ARM64 and Rosetta.
+It has read-only repository access, no secrets, and no signing, deployment or release.
+Diagnostics for future approved runs are retained for 3 days; model weights and audio
+are not uploaded. Existing artifacts keep their original retention period.
+
+## Run on a physical Intel Mac instead
 
 Requires native Intel macOS 14+, full Xcode with a Swift 6+ toolchain, Python 3, Git,
-and internet access for public dependency/model/tokenizer downloads. The workflow's
-macOS 15 result alone does not validate the macOS 14 deployment floor.
+and internet access for public dependency/model/tokenizer downloads. Check those
+prerequisites first; the hosted macOS 15 result does not validate macOS 14.
 
-From this repository on the `intel-spike` branch:
+From this repository on the `intel-spike` branch, run only the CPU test initially:
 
 ```bash
 python3 -m unittest discover -s experiments/intel-whisperkit/tests -v
 python3 experiments/intel-whisperkit/run.py --compute cpu
-python3 experiments/intel-whisperkit/run.py --compute cpu-gpu
-# Later, assess the actual application model separately:
-python3 experiments/intel-whisperkit/run.py --compute cpu \
-  --model openai_whisper-large-v3-v20240930_turbo
 ```
 
-Each command creates a new timestamped results directory. `--output PATH` selects a
+These commands run on the local computer, not GitHub Actions. No personal recording
+is needed. Do not run further compute settings or larger models until this result
+has been reviewed. `--compute cpu-gpu` and `--model` remain available for later,
+deliberately chosen comparisons.
+
+Each invocation creates a new timestamped results directory. `--output PATH` selects a
 new directory explicitly; an existing directory is refused to prevent stale results.
-Resolution, build, and inference have bounded subprocess timeouts. The probe safety
+Resolution, build, and inference have bounded subprocess timeouts. The local probe
 limit defaults to 1,200 seconds and is adjustable with `--probe-timeout` (1–3,600).
 A timeout is inconclusive, not proof that Intel cannot run the engine.
 
@@ -81,25 +105,19 @@ CPU, OS, Xcode, Swift, architecture, runner image and source commit. `app-pins.j
 runtime failures. `raw.json` is checkpointed before model download/load and every inference,
 so even a crash or timeout can leave its last stage. `/usr/bin/time -l` resource usage is
 in `probe.log`. `model-files.json` fingerprints downloaded model/tokenizer cache files.
+For the first GPU failure, the important detail is in `raw.json`, not its generic summary.
 
 **Model limitation:** dependency source and the fixture are pinned, but Hugging Face
 model/tokenizer artifacts are fetched at run time, not from an immutable snapshot.
 Compare fingerprints before comparing runs; do not describe changed model bytes as a
 hardware-only comparison. This is not the app's production model-delivery mechanism.
 
-A hosted Intel VM can expose no usable Metal GPU. Requested CPU/GPU compute is not
-proof that Core ML used a GPU. An isolated GPU-job failure does not invalidate a CPU
-success, and no hosted timing substitutes for measurements on the target physical Mac.
+A hosted Intel VM can expose a virtual or unusable Metal GPU. Requested CPU/GPU compute
+is not proof that Core ML used a GPU. The saved first run lists `Apple Paravirtual device`.
+That is not enough evidence to attribute the crash to the GPU. Hosted timing is not a
+substitute for measurements on the target physical Mac.
 
-## Next decision
-
-- Build failure: identify the exact dependency/compiler/SDK blocker before app changes.
-- Download failure: fix network/model access; no Intel compatibility conclusion yet.
-- Load/inference failure: inspect Core ML errors and CPU-only behavior; then consider a
-  small compatibility patch or a whisper.cpp backend rather than assuming a rewrite.
-- Tiny passes: benchmark larger models and real dictations on the target Intel Mac,
-  then attempt the whole app build and address VAD, Parakeet gating, bundled ARM binaries,
-  helpers, and fork-specific update configuration.
-
-No successful run is claimed until its actual workflow report exists. This addition
-is intentionally not evidence of an installable Intel app or Apple Silicon feature parity.
+A successful small-model test would establish an engine foothold only. The full app,
+larger models, VAD, Parakeet gating, bundled ARM binaries, helpers, and fork-specific
+updates remain separate work. No successful transcription or installable Intel app
+is claimed by this experiment yet.
