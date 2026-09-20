@@ -1,0 +1,69 @@
+name: Intel WhisperKit Spike
+
+on:
+  push:
+    branches: [intel-spike]
+    paths:
+      - experiments/intel-whisperkit/**
+      - .github/workflows/intel-whisperkit-spike.yml
+      - Package.resolved
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Model to test (Tiny is only a smoke test; Turbo is the app default)
+        type: choice
+        default: openai_whisper-tiny.en
+        options:
+          - openai_whisper-tiny.en
+          - openai_whisper-base.en
+          - openai_whisper-large-v3-v20240930_turbo
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intel-whisperkit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    if: github.repository == 'A54DH/EnviousWispr-Intel'
+    name: Intel / ${{ matrix.compute }}
+    runs-on: macos-15-intel
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        compute: [cpu, cpu-gpu]
+    env:
+      PROBE_MODEL: ${{ inputs.model || 'openai_whisper-tiny.en' }}
+      PROBE_COMPUTE: ${{ matrix.compute }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Assert native Intel runner
+        shell: bash
+        run: |
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -m)" = x86_64
+          test "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" != 1
+      - name: Test diagnostic scoring and error handling
+        run: python3 -m unittest discover -s experiments/intel-whisperkit/tests -v
+      - name: Build, load and transcribe with the app-pinned WhisperKit
+        run: |
+          python3 experiments/intel-whisperkit/run.py \
+            --compute "$PROBE_COMPUTE" \
+            --model "$PROBE_MODEL" \
+            --output "experiments/intel-whisperkit/results/$PROBE_COMPUTE"
+      - name: Retain diagnostic evidence even after failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: intel-whisperkit-${{ matrix.compute }}-${{ github.run_attempt }}
+          path: |
+            experiments/intel-whisperkit/results/${{ matrix.compute }}/*.json
+            experiments/intel-whisperkit/results/${{ matrix.compute }}/*.log
+            experiments/intel-whisperkit/results/${{ matrix.compute }}/*.md
+          if-no-files-found: warn
+          retention-days: 14
