@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>Phone → Mac</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<main>
+  <header><span class="eyebrow">PHONEBRIDGE / EXPERIMENT 01</span><h1>Your words.<br>Your Mac.</h1>
+    <p>Dictate here with your iPhone keyboard. Send the finished text to your Mac.</p></header>
+  <aside class="warning"><strong>Trusted home Wi-Fi only.</strong> This prototype is not encrypted. No passwords or confidential text.</aside>
+  <section aria-labelledby="connection-title">
+    <h2 id="connection-title">01 · Connect</h2>
+    <p id="connection" role="status">Opening your local connection…</p>
+    <button id="connect" type="button" class="secondary">Connect to Mac</button>
+  </section>
+  <section aria-labelledby="target-title">
+    <h2 id="target-title">02 · Choose where the words go</h2>
+    <p>Click inside a document on your Mac first. Then tap below. Try TextEdit for the first test.</p>
+    <button id="arm" type="button" class="secondary" disabled>Use current Mac text field</button>
+    <p id="target" class="detail" role="status">No destination chosen.</p>
+  </section>
+  <section aria-labelledby="draft-title">
+    <h2 id="draft-title">03 · Speak, review, send</h2>
+    <label for="draft">Tap here, then tap the microphone on your iPhone keyboard.</label>
+    <textarea id="draft" rows="7" maxlength="12000" placeholder="Your dictated words appear here…" autocomplete="off" spellcheck="true"></textarea>
+    <p class="detail">Stop keyboard dictation and review the text before sending. Keep this page open. There is no webpage microphone button.</p>
+    <button id="send" type="button" disabled>Send to Mac</button>
+    <p id="result" role="status" aria-live="polite">Nothing sent yet.</p>
+    <button id="discard" class="secondary" type="button" hidden>Stop retrying — keep draft</button>
+  </section>
+  <footer>No account. No third-party scripts. Only finished text is sent by this page, when you tap Send. Apple keyboard dictation and your Mac clipboard have their own privacy settings.</footer>
+</main>
+</body>
+</html>

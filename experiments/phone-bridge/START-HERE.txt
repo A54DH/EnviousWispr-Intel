@@ -1,0 +1,26 @@
+PHONEBRIDGE — FIRST TRY
+
+On your MAC (not your iPhone):
+
+1. Open Terminal.
+2. Type: bash  (leave a space after it).
+3. Drag build-and-open.command into Terminal and press Return.
+4. Follow any missing-developer-tools instruction, then repeat.
+
+The script builds and opens a small Mac app. It does not use GitHub Actions.
+No paid account, full Xcode app, Homebrew, Python or Node is needed to run it.
+This needs macOS 12+ and Apple's command-line developer tools.
+
+In the app:
+- Start on trusted home Wi-Fi only.
+- Scan the QR code using your iPhone Camera and open Safari.
+- Approve the phone in the Mac window.
+- First try copy-only: dictate on the phone, send, then Command-V in TextEdit.
+- Then enable automatic paste + Accessibility and follow README.md's second test.
+
+IMPORTANT: The connection is not encrypted. Use harmless test sentences only.
+The code has not yet been built or tested on a real Mac/iPhone pair.
+Keep Actions disabled. Do not merge the earlier Intel pull request.
+
+If the build fails, share the Terminal error; do not start GitHub Actions.
+If it works, the desired result is one sentence appearing exactly once in TextEdit.
