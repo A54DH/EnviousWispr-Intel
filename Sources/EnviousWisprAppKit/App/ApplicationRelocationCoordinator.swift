@@ -13,8 +13,9 @@ import Security
 // into a writable Applications folder, relaunches, and — critically — waits for
 // the newly launched copy to hand back a health confirmation before the current
 // (only known-good) process terminates. Every failure leaves the current
-// process usable: this is a launch-time LIMB, never a prerequisite for menu-bar
-// setup, hotkeys, dictation, or onboarding.
+// process usable. A due update-blocking launch waits for the offer and move
+// outcome before normal startup (#3252); every non-handoff outcome permits
+// normal startup, and healthy and offer-not-due launches proceed immediately.
 //
 // Design + amendment rationale (handshake A1, presentation-only marker A2,
 // atomic replace A3, signature validation A4, bounded flush A5, no original
@@ -134,6 +135,10 @@ public enum RelocationFailure: String, Error, Sendable, CaseIterable {
   /// No decodable ack before the deadline. The only class implicating
   /// `handshakeTimeout`.
   case ackTimeout
+  /// The whole move (install, launch and acknowledgement) did not finish before the
+  /// pre-flight watchdog expired, so the current process was kept (#3252, plan 3.7). Nothing
+  /// is known to be placed, so it is reported as Message A.
+  case installTimedOut
   case unknown
 
   /// The install route this failure ITSELF identifies, for the terminal events
@@ -156,7 +161,7 @@ public enum RelocationFailure: String, Error, Sendable, CaseIterable {
     case .destinationCreation, .destinationRunning, .stagingCopy, .stagedBundleInvalid,
       .signatureInvalid, .destinationConflict, .diskFull, .stripFailedBeforePlacement,
       .relaunchRejected, .ackUnhealthyTranslocated, .ackUnhealthyOther, .ackPathMismatch,
-      .ackVersionMismatch, .ackMalformed, .ackTimeout, .unknown:
+      .ackVersionMismatch, .ackMalformed, .ackTimeout, .installTimedOut, .unknown:
       return InstallResolution.TelemetryLabel.unresolved
     }
   }
@@ -387,7 +392,8 @@ protocol RelocationHandshaking: Sendable {
   @discardableResult
   func writeAck(
     attemptID: String, resolvedPath: String, healthy: Bool, stateLabel: String?,
-    bundleVersion: String?) -> Bool
+    bundleVersion: String?
+  ) -> Bool
 }
 
 /// Bounded `update.relocation_*` telemetry. Live impl forwards to
@@ -408,6 +414,72 @@ protocol RelocationHandshaking: Sendable {
   /// after a successful `.existingRunning` activation, which launches no child.
   func completed(
     reason: String, destinationScope: String, attemptID: String, completionSource: String)
+}
+
+// MARK: - Launch decision and hand-off authority (#3252)
+
+/// What the launch should do about the move offer (plan 3.2). Pure and synchronous: value inputs
+/// in, a value out. It never reads or writes the decline store; clearing a stale decline is
+/// `reportLaunchState()`'s job (plan 3.6), so a blocked launch inside the cooldown keeps its
+/// record.
+enum LaunchDecision: Equatable, Sendable {
+  /// Build and start the app exactly as before: a relaunched child, a location that does not
+  /// block updates, or an offer that is not due.
+  case proceed
+  /// Show the offer before the app starts any work. The caller chooses the destination.
+  case offerFirst(state: ApplicationLocationState)
+
+  @MainActor
+  static func decide(
+    isRelaunchChild: Bool, state: ApplicationLocationState,
+    lastDecline: (at: Date, version: String)?, currentVersion: String, now: Date
+  ) -> LaunchDecision {
+    if isRelaunchChild { return .proceed }
+    guard state.isUpdateBlocking else { return .proceed }
+    guard
+      ApplicationRelocationCoordinator.offerIsDue(
+        lastDecline: lastDecline, currentVersion: currentVersion, now: now)
+    else { return .proceed }
+    return .offerFirst(state: state)
+  }
+}
+
+/// The single owner of "may this process advance a move, launch or activate a destination, and
+/// terminate" (plan 3.4). `pending` becomes `committed` or `released`, once, and never goes
+/// back. `commit()` is called only immediately before `terminate()`, with no suspension between
+/// them. `release()` happens on every exit that does not hand off. After either, every later
+/// attempt fails, which is what makes a late result inert.
+@MainActor
+final class HandoffAuthority {
+  enum State: Equatable, Sendable { case pending, committed, released }
+
+  private(set) var state: State = .pending
+  var isPending: Bool { state == .pending }
+
+  /// True only from `pending`.
+  @discardableResult
+  func commit() -> Bool {
+    guard state == .pending else { return false }
+    state = .committed
+    return true
+  }
+
+  /// True only from `pending`.
+  @discardableResult
+  func release() -> Bool {
+    guard state == .pending else { return false }
+    state = .released
+    return true
+  }
+}
+
+/// How `runPreflight` ended (plan 3.4).
+enum PreflightOutcome: Equatable, Sendable {
+  /// Start the app normally, once. `failure` is the card to show AFTER the app has started
+  /// (never before: it is modal, and its copy says the app keeps working).
+  case continueNormally(failure: RelocationFailurePresentation?)
+  /// The parent committed and requested termination. Do nothing more.
+  case handedOff
 }
 
 // MARK: - Coordinator
@@ -435,17 +507,40 @@ final class ApplicationRelocationCoordinator {
   /// copy — strictly better than a blocking flush with a timeout.
   private let flushTelemetry: @MainActor () -> Void
   private let makeAttemptID: @Sendable () -> String
+  private let chooseDestination: @MainActor (String) -> Destination
+  private let moveWatchdogSeconds: TimeInterval
+  private let watchdogSleep: @Sendable (TimeInterval) async throws -> Void
+  /// Whether the destination copy is still a running process. Checked immediately before the
+  /// commit, so a child that wrote a healthy ack and then exited does not leave the person with
+  /// no running app.
+  private let destinationIsRunning: @MainActor (String, URL) -> Bool
 
   /// Re-prompt cadence: a "Not Now" is honored for seven days or until the
   /// bundle version changes, whichever comes first.
   static let declineCooldown: TimeInterval = 7 * 24 * 60 * 60
 
-  private var moveInProgress = false
+  /// Move watchdog (#3252, plan 3.7): N = max(20 s, 3 x max(cold p99, warm p99)). Measured on a
+  /// rented M1 16 GB with macOS 14.8.9, notarized build 0.0.3252, source opened from a quarantined
+  /// disk image (macOS translocated it), 30 cold and 30 warm externally validated full moves: the
+  /// slowest cold move took 5.22 s and the slowest warm move 0.72 s (nearest-rank p99 of 30 is the
+  /// maximum; each figure is an upper bound from Move press to observed parent exit). 3 x 5.22 s
+  /// is 15.7 s, so the 20 s floor governs. Not measured: the 8 GB M1 support floor or slower
+  /// storage. Evidence: `artifacts/issue-3252-chunk4/` (`analyze.py`, `host-evidence/`).
+  static let defaultMoveWatchdogSeconds: TimeInterval = 20
 
-  /// The scheduled presentation/move task from the most recent
-  /// `evaluateAndOfferIfNeeded()`. Exposed so tests can deterministically await
-  /// the full flow; production never reads it.
-  private(set) var pendingWork: Task<Void, Never>?
+  /// The one pre-flight run of this coordinator. A second call awaits the same run and returns
+  /// its outcome, so a repeated call can never start the app while the first move can still
+  /// quit it.
+  private var preflightTask: Task<PreflightOutcome, Never>?
+
+  /// The worker task of the most recent pre-flight move. Exposed so tests can await the SUBJECT's
+  /// own completion after a watchdog expiry; production never reads it. It is never cancelled:
+  /// cancellation is not what keeps a late result inert, the released authority is.
+  private(set) var preflightWorker: Task<Void, Never>?
+
+  /// The authority of the most recent pre-flight move, exposed for the same reason as
+  /// `preflightWorker`: tests read its final state; production never does.
+  private(set) var preflightAuthority: HandoffAuthority?
 
   init(
     env: RelocationEnvironment,
@@ -460,7 +555,18 @@ final class ApplicationRelocationCoordinator {
     terminate: @escaping @MainActor () -> Void,
     handshakeTimeout: TimeInterval = 8,
     flushTelemetry: @escaping @MainActor () -> Void = {},
-    makeAttemptID: @escaping @Sendable () -> String = { UUID().uuidString }
+    makeAttemptID: @escaping @Sendable () -> String = { UUID().uuidString },
+    chooseDestination: @escaping @MainActor (String) -> Destination = {
+      ApplicationRelocationCoordinator.chooseDestination(appName: $0)
+    },
+    moveWatchdogSeconds: TimeInterval = ApplicationRelocationCoordinator
+      .defaultMoveWatchdogSeconds,
+    watchdogSleep: @escaping @Sendable (TimeInterval) async throws -> Void = {
+      try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000))
+    },
+    destinationIsRunning: @escaping @MainActor (String, URL) -> Bool = {
+      FileManagerApplicationMover.isRunning(bundleIdentifier: $0, at: $1)
+    }
   ) {
     self.env = env
     self.detector = detector
@@ -475,12 +581,14 @@ final class ApplicationRelocationCoordinator {
     self.handshakeTimeout = handshakeTimeout
     self.flushTelemetry = flushTelemetry
     self.makeAttemptID = makeAttemptID
+    self.chooseDestination = chooseDestination
+    self.moveWatchdogSeconds = moveWatchdogSeconds
+    self.watchdogSleep = watchdogSleep
+    self.destinationIsRunning = destinationIsRunning
   }
 
-  /// Called once from `AppLifecycleCoordinator.runDidFinishLaunching()`. Returns
-  /// immediately after scheduling any presentation; never blocks launch, copies,
-  /// shells, hits the network, or waits for a relaunch inline.
-  func evaluateAndOfferIfNeeded() {
+  /// Location state for this launch, including the DEBUG-only forced state.
+  private func detectState() -> ApplicationLocationState {
     var state = detector.state(for: env.bundleURL)
 
     #if DEBUG
@@ -498,7 +606,25 @@ final class ApplicationRelocationCoordinator {
         }
       }
     #endif
+    return state
+  }
 
+  /// What this launch should do about the offer (plan 3.2). Gathers the value inputs for the
+  /// pure `LaunchDecision.decide`; clears nothing.
+  func launchDecision() -> LaunchDecision {
+    LaunchDecision.decide(
+      isRelaunchChild: env.relaunchAttemptID != nil, state: detectState(),
+      lastDecline: suppression.lastDecline(), currentVersion: env.currentVersion, now: now())
+  }
+
+  /// The launch-state duties that outlive the offer (plan 3.6): (1) the relaunched child's
+  /// health ack, its `completed` event and its unhealthy quit; (2) clearing a stale decline on
+  /// every launch whose location does not block updates. It never shows an offer.
+  func reportLaunchState() {
+    reportLaunchState(state: detectState())
+  }
+
+  private func reportLaunchState(state: ApplicationLocationState) {
     // A1/A2: this process is the relaunched child. Report health via the ack
     // (detection STILL runs — the marker suppresses a second dialog, never
     // detection, so a failed move cannot masquerade as healthy) and return.
@@ -553,40 +679,29 @@ final class ApplicationRelocationCoordinator {
       // stays alive as the authoritative copy (its handshake fails). Quit this
       // redundant child rather than leave two blocked instances running (cloud
       // Codex review #1490). Healthy child lives on as the new app; the two
-      // branches are mutually exclusive, so there is never zero or two copies.
+      // branches are mutually exclusive within this child. A healthy late child
+      // may coexist with a parent that already timed out and started normally.
       if !healthy { terminate() }
       return
     }
 
-    guard state.isUpdateBlocking else {
-      // A healthy launch clears any stale decline marker so a user who later
-      // regresses is offered fresh.
-      suppression.clear()
-      return
-    }
-
-    guard !moveInProgress, shouldOffer(now: now()) else { return }
-    guard let reason = state.reasonLabel else { return }
-
-    let destination = Self.chooseDestination(appName: env.bundleURL.lastPathComponent)
-    telemetry.offered(reason: reason, destinationScope: destination.scope)
-
-    // Present on the next main-loop turn: the app can become active first, and
-    // launch continues without awaiting this.
-    pendingWork = Task { @MainActor [weak self] in
-      await self?.presentAndHandle(state: state, destination: destination)
-    }
+    // A healthy (non-blocking) launch clears any stale decline marker so a user who later
+    // regresses is offered fresh. A blocked launch keeps its record.
+    if !state.isUpdateBlocking { suppression.clear() }
   }
 
   // MARK: Cadence
 
   /// True when we may show the prompt: never declined, or the decline is stale
   /// (>7d) or from a different version. No permanent "don't ask again" — that
-  /// would knowingly leave updates broken forever.
-  func shouldOffer(now: Date) -> Bool {
-    guard let decline = suppression.lastDecline() else { return true }
-    if decline.version != env.currentVersion { return true }
-    return now.timeIntervalSince(decline.at) >= Self.declineCooldown
+  /// would knowingly leave updates broken forever. The one cadence definition; its only
+  /// production caller is `LaunchDecision.decide`.
+  static func offerIsDue(
+    lastDecline: (at: Date, version: String)?, currentVersion: String, now: Date
+  ) -> Bool {
+    guard let decline = lastDecline else { return true }
+    if decline.version != currentVersion { return true }
+    return now.timeIntervalSince(decline.at) >= declineCooldown
   }
 
   // MARK: Destination
@@ -613,57 +728,6 @@ final class ApplicationRelocationCoordinator {
 
   // MARK: Flow
 
-  private func presentAndHandle(state: ApplicationLocationState, destination: Destination) async {
-    guard let reason = state.reasonLabel else { return }
-    switch await presenter.present() {
-    case .notNow:
-      suppression.recordDecline(at: now(), version: env.currentVersion)
-      telemetry.declined(reason: reason)
-    case .move:
-      // Mint the id BEFORE `accepted` so the ingress event and every terminal
-      // event share one join key. It used to be minted inside the relaunch
-      // path, so `accepted` carried none and nothing could be joined to it —
-      // which is why four accepted attempts in 30 d have no known outcome.
-      let attemptID = makeAttemptID()
-      telemetry.accepted(
-        reason: reason, destinationScope: destination.scope, attemptID: attemptID)
-      await performMove(reason: reason, destination: destination, attemptID: attemptID)
-    }
-  }
-
-  private func performMove(reason: String, destination: Destination, attemptID: String) async {
-    guard !moveInProgress else { return }
-    moveInProgress = true
-    defer { moveInProgress = false }
-
-    presenter.showProgress()
-
-    let result = await mover.install(
-      source: env.bundleURL, destination: destination.url,
-      expectedBundleIdentifier: env.bundleIdentifier, currentVersion: env.currentVersion)
-
-    switch result {
-    case .failure(let failure):
-      presenter.dismissProgress()
-      // The mover returns Result<InstallResolution, _>, so a failure carries no
-      // resolution to read — but the failure itself can still identify the
-      // route (see `impliedInstallResolution`).
-      telemetry.failed(
-        reason: reason, failureClass: failure.rawValue, attemptID: attemptID,
-        installResolution: failure.impliedInstallResolution)
-      presenter.showFailure(Self.presentation(for: failure, destination: destination.url))
-    case .success(let resolution) where resolution.isExistingRunning:
-      // A verified same-or-newer copy is already running: bring it to the front
-      // and terminate this translocated duplicate. No new instance, no
-      // handshake (cloud Codex review #1490).
-      await activateAndHandOff(
-        reason: reason, destination: destination, resolution: resolution, attemptID: attemptID)
-    case .success(let resolution):
-      await relaunchAndHandOff(
-        reason: reason, destination: destination, resolution: resolution, attemptID: attemptID)
-    }
-  }
-
   /// The sole A/B routing decision (#2006 §3.3). Message B requires positive
   /// evidence that a verified copy is present and not known-bad; every other
   /// origin gets Message A, whose instruction — drag it yourself — is safe in
@@ -680,83 +744,261 @@ final class ApplicationRelocationCoordinator {
     case .destinationCreation, .destinationRunning, .stagingCopy, .stagedBundleInvalid,
       .signatureInvalid, .destinationConflict, .diskFull, .stripFailedBeforePlacement,
       .stripFailedAtDestination, .stripFailedAfterPlacement, .ackUnhealthyTranslocated,
-      .ackUnhealthyOther, .unknown:
+      .ackUnhealthyOther, .installTimedOut, .unknown:
       // A copy that may be unclean is never offered for opening, whichever
       // route left it that way.
       return .nothingMoved(failure)
     }
   }
 
-  /// The good copy is already running: activate it, then terminate self. If it
-  /// cannot be activated, keep the current process alive and report failure.
-  private func activateAndHandOff(
-    reason: String, destination: Destination, resolution: InstallResolution, attemptID: String
-  ) async {
-    guard await relauncher.activateRunning(resolution.url) else {
+  // MARK: Pre-flight (#3252, plan 3.4)
+
+  /// Shows the failure card `runPreflight` returned. The caller runs it only AFTER the app has
+  /// started, on a later run-loop turn: the card is modal and its copy says the app keeps working.
+  func presentFailure(_ presentation: RelocationFailurePresentation) {
+    presenter.showFailure(presentation)
+  }
+
+  /// How one move attempt resolved. Resolved exactly once, by the worker or the watchdog,
+  /// whichever releases the authority first.
+  private enum MoveResolution: Sendable {
+    case handedOff
+    case failed(RelocationFailure, RelocationFailurePresentation, installResolution: String)
+    case timedOut
+  }
+
+  /// What one stage sequence ended in. `abandoned` means the authority was no longer pending,
+  /// so the stage did nothing further and the resolution belongs to someone else.
+  private enum StageResult: Sendable {
+    case handedOff
+    case failed(RelocationFailure, RelocationFailurePresentation, installResolution: String)
+    case abandoned
+  }
+
+  /// One-shot rendezvous: the first `resolve` wins and the others are ignored.
+  @MainActor
+  private final class MoveCompletion {
+    private var value: MoveResolution?
+    private var waiter: CheckedContinuation<MoveResolution, Never>?
+
+    func resolve(_ resolution: MoveResolution) {
+      guard value == nil else { return }
+      value = resolution
+      waiter?.resume(returning: resolution)
+      waiter = nil
+    }
+
+    func wait() async -> MoveResolution {
+      if let value { return value }
+      return await withCheckedContinuation { waiter = $0 }
+    }
+  }
+
+  /// Runs the offer for a launch that `LaunchDecision` returned `.offerFirst` for, before the
+  /// app starts any work. The caller starts the app normally on `.continueNormally` and shows
+  /// the returned card only AFTER that. Runs once per coordinator: a repeated or reentrant call
+  /// awaits the first run and returns the same outcome, with no second offer and no second
+  /// worker. A move that does not finish before the watchdog expires releases the authority and
+  /// returns without waiting for the late worker.
+  func runPreflight(state: ApplicationLocationState) async -> PreflightOutcome {
+    if let task = preflightTask { return await task.value }
+    let task = Task { @MainActor [self] in await executePreflight(state: state) }
+    preflightTask = task
+    return await task.value
+  }
+
+  private func executePreflight(state: ApplicationLocationState) async -> PreflightOutcome {
+    guard let reason = state.reasonLabel else { return .continueNormally(failure: nil) }
+
+    let destination = chooseDestination(env.bundleURL.lastPathComponent)
+    telemetry.offered(reason: reason, destinationScope: destination.scope)
+
+    switch await presenter.present() {
+    case .notNow:
+      suppression.recordDecline(at: now(), version: env.currentVersion)
+      telemetry.declined(reason: reason)
+      return .continueNormally(failure: nil)
+    case .move:
+      return await runMove(reason: reason, destination: destination)
+    }
+  }
+
+  private func runMove(reason: String, destination: Destination) async -> PreflightOutcome {
+    // Mint the id BEFORE `accepted` so the ingress event and every terminal event share one
+    // join key. It used to be minted inside the relaunch path, so `accepted` carried none and
+    // nothing could be joined to it, which is why four accepted attempts in 30 d have no known
+    // outcome.
+    let attemptID = makeAttemptID()
+    telemetry.accepted(reason: reason, destinationScope: destination.scope, attemptID: attemptID)
+    presenter.showProgress()
+
+    let authority = HandoffAuthority()
+    preflightAuthority = authority
+    let completion = MoveCompletion()
+    // The watchdog starts when Move is accepted, not while the person considers the offer.
+    let worker = Task { @MainActor [self] in
+      let result = await runMoveStages(
+        authority: authority, reason: reason, destination: destination, attemptID: attemptID)
+      switch result {
+      case .handedOff:
+        completion.resolve(.handedOff)
+      case .failed(let failure, let presentation, let installResolution):
+        if authority.release() {
+          completion.resolve(
+            .failed(failure, presentation, installResolution: installResolution))
+        }
+      case .abandoned:
+        break
+      }
+    }
+    preflightWorker = worker
+    let watchdog = Task { @MainActor [self] in
+      do { try await watchdogSleep(moveWatchdogSeconds) } catch { return }
+      if authority.release() { completion.resolve(.timedOut) }
+    }
+
+    let resolution = await completion.wait()
+    // Cleanup only. A cancelled sleep that already returned changes nothing, and the worker is
+    // never cancelled: the released authority is what keeps a late result inert.
+    watchdog.cancel()
+    switch resolution {
+    case .handedOff:
+      return .handedOff
+    case .failed(let failure, let presentation, let installResolution):
       presenter.dismissProgress()
       telemetry.failed(
-        reason: reason, failureClass: RelocationFailure.relaunchRejected.rawValue,
-        attemptID: attemptID, installResolution: resolution.telemetryLabel)
-      presenter.showFailure(
-        Self.presentation(for: .relaunchRejected, destination: resolution.url))
-      return
+        reason: reason, failureClass: failure.rawValue, attemptID: attemptID,
+        installResolution: installResolution)
+      return .continueNormally(failure: presentation)
+    case .timedOut:
+      presenter.dismissProgress()
+      let failure = RelocationFailure.installTimedOut
+      telemetry.failed(
+        reason: reason, failureClass: failure.rawValue, attemptID: attemptID,
+        installResolution: InstallResolution.TelemetryLabel.unresolved)
+      return .continueNormally(
+        failure: Self.presentation(for: failure, destination: destination.url))
     }
+  }
+
+  /// Install, then activate or relaunch. Every stage is entered only while the authority is
+  /// pending and re-checks it after every suspension, so a late result does nothing: no launch,
+  /// no activation, no termination, no card, no second terminal event. Terminal events other than
+  /// the success ones belong to `runMove`.
+  private func runMoveStages(
+    authority: HandoffAuthority, reason: String, destination: Destination, attemptID: String
+  ) async -> StageResult {
+    guard authority.isPending else { return .abandoned }
+    let result = await mover.install(
+      source: env.bundleURL, destination: destination.url,
+      expectedBundleIdentifier: env.bundleIdentifier, currentVersion: env.currentVersion)
+    guard authority.isPending else { return .abandoned }
+
+    switch result {
+    case .failure(let failure):
+      // The mover returns Result<InstallResolution, _>, so a failure carries no resolution to
+      // read, but the failure itself can still identify the route (see
+      // `impliedInstallResolution`).
+      return .failed(
+        failure, Self.presentation(for: failure, destination: destination.url),
+        installResolution: failure.impliedInstallResolution)
+    case .success(let resolution) where resolution.isExistingRunning:
+      // A verified same-or-newer copy is already running: bring it to the front and terminate
+      // this translocated duplicate. No new instance, no handshake (cloud Codex review #1490).
+      return await activateStage(
+        authority: authority, reason: reason, destination: destination, resolution: resolution,
+        attemptID: attemptID)
+    case .success(let resolution):
+      return await relaunchStage(
+        authority: authority, reason: reason, destination: destination, resolution: resolution,
+        attemptID: attemptID)
+    }
+  }
+
+  /// The good copy is already running: activate it, then terminate self. If it cannot be
+  /// activated, keep the current process alive and report failure.
+  private func activateStage(
+    authority: HandoffAuthority, reason: String, destination: Destination,
+    resolution: InstallResolution, attemptID: String
+  ) async -> StageResult {
+    guard authority.isPending else { return .abandoned }
+    let activated = await relauncher.activateRunning(resolution.url)
+    guard authority.isPending else { return .abandoned }
+    guard activated else {
+      return .failed(
+        .relaunchRejected, Self.presentation(for: .relaunchRejected, destination: resolution.url),
+        installResolution: resolution.telemetryLabel)
+    }
+    // The activated copy must still be running. External exit after this check cannot be
+    // prevented; the check closes the window to the instructions below, which never suspend.
+    guard destinationIsRunning(env.bundleIdentifier, resolution.url) else {
+      return .failed(
+        .relaunchRejected, Self.presentation(for: .relaunchRejected, destination: resolution.url),
+        installResolution: resolution.telemetryLabel)
+    }
+    // No suspension from here to terminate(): commit, then the success events, then quit.
+    guard authority.commit() else { return .abandoned }
     telemetry.relaunched(
       reason: reason, destinationScope: destination.scope, relaunchConfirmed: true,
       attemptID: attemptID, installResolution: resolution.telemetryLabel)
-    // This route launches NO child, so a child-only `completed` would silently
-    // drop the whole existing-running success path from the success rate.
+    // This route launches NO child, so a child-only `completed` would silently drop the whole
+    // existing-running success path from the success rate.
     telemetry.completed(
       reason: reason, destinationScope: destination.scope, attemptID: attemptID,
       completionSource: "existing_running_activation")
     flushTelemetry()
     terminate()
+    return .handedOff
   }
 
-  /// Relaunch, then wait for the new instance's health ack BEFORE terminating
-  /// the current (only known-good) process. NSWorkspace acceptance alone is not
-  /// a sufficient handoff boundary (A1).
-  private func relaunchAndHandOff(
-    reason: String, destination: Destination, resolution: InstallResolution, attemptID: String
-  ) async {
+  /// Relaunch, then wait for the new instance's health ack BEFORE terminating the current (only
+  /// known-good) process. NSWorkspace acceptance alone is not a sufficient handoff boundary (A1).
+  private func relaunchStage(
+    authority: HandoffAuthority, reason: String, destination: Destination,
+    resolution: InstallResolution, attemptID: String
+  ) async -> StageResult {
     let installedURL = resolution.url
-    guard
-      await relauncher.relaunch(
-        installedURL, attemptID: attemptID, reason: reason,
-        destinationScope: destination.scope,
-        expectedBundleVersion: resolution.bundleVersion)
-    else {
-      presenter.dismissProgress()
-      telemetry.failed(
-        reason: reason, failureClass: RelocationFailure.relaunchRejected.rawValue,
-        attemptID: attemptID, installResolution: resolution.telemetryLabel)
-      presenter.showFailure(Self.presentation(for: .relaunchRejected, destination: installedURL))
-      return
+    guard authority.isPending else { return .abandoned }
+    let launched = await relauncher.relaunch(
+      installedURL, attemptID: attemptID, reason: reason, destinationScope: destination.scope,
+      expectedBundleVersion: resolution.bundleVersion)
+    guard authority.isPending else { return .abandoned }
+    guard launched else {
+      return .failed(
+        .relaunchRejected, Self.presentation(for: .relaunchRejected, destination: installedURL),
+        installResolution: resolution.telemetryLabel)
     }
 
-    // Expected version comes from the MOVER's resolution, never from
-    // env.currentVersion: `.existingUsable` accepts a same-or-newer copy, so
-    // the destination's version can legitimately exceed ours (#2006 §3.2).
+    // Expected version comes from the MOVER's resolution, never from env.currentVersion:
+    // `.existingUsable` accepts a same-or-newer destination (#2006 §3.2).
     let outcome = await handshake.awaitAck(
       attemptID: attemptID, destination: installedURL,
       expectedBundleVersion: resolution.bundleVersion, timeout: handshakeTimeout)
+    guard authority.isPending else { return .abandoned }
     guard outcome == .confirmed else {
-      // The new copy never confirmed healthy at the destination. Keep the
-      // current process alive rather than strand the user with no working app.
-      presenter.dismissProgress()
+      // The new copy never confirmed healthy at the destination. Keep the current process alive
+      // rather than strand the user with no working app.
       let failure = outcome.failure
-      telemetry.failed(
-        reason: reason, failureClass: failure.rawValue, attemptID: attemptID,
+      return .failed(
+        failure, Self.presentation(for: failure, destination: installedURL),
         installResolution: resolution.telemetryLabel)
-      presenter.showFailure(Self.presentation(for: failure, destination: installedURL))
-      return
     }
 
+    // A healthy ack is a file the child wrote; the child may have exited since. Quit only while
+    // the destination copy is still running. Exit after this check cannot be prevented.
+    guard destinationIsRunning(env.bundleIdentifier, installedURL) else {
+      return .failed(
+        .relaunchRejected, Self.presentation(for: .relaunchRejected, destination: installedURL),
+        installResolution: resolution.telemetryLabel)
+    }
+    // No suspension from here to terminate().
+    guard authority.commit() else { return .abandoned }
     telemetry.relaunched(
       reason: reason, destinationScope: destination.scope, relaunchConfirmed: true,
       attemptID: attemptID, installResolution: resolution.telemetryLabel)
     // A5: best-effort, non-blocking flush; never delays the handoff.
     flushTelemetry()
     terminate()
+    return .handedOff
   }
 }
