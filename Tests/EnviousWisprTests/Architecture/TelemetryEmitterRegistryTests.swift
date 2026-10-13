@@ -180,8 +180,26 @@ struct TelemetryEmitterRegistryTests {
   /// moves to per_change; `hotkey.pressed` gains `press_action=refused_key_held`, one row per
   /// refused bare-modifier push-to-talk press, kept whole. No content, no ordinary-key identity;
   /// readers named on both registry rows.
+  /// #3546 §3.7 T1: no new site or event. Fourteen emitters gain a `model:` parameter (the
+  /// five `asr_model*` properties on rows that already fire, at their existing cadence), which
+  /// moves the function signatures this fingerprint names.
+  /// #3546 §3.7 T2: new `parakeet_upgrade.activation` site (`parakeetUpgradeActivation`).
+  /// Checklist: per_change, keep; one row per Parakeet Ultra upgrade outcome, each outcome sent at
+  /// most once per target per install (`deferred_disk`, `cleanup_failed` once per target per app
+  /// version), deduplicated by `ParakeetUpgradeTelemetry`'s ledger, which records only rows handed
+  /// to a running PostHog. Bound: eight outcomes per target per install plus the two
+  /// version-scoped repeats; one row per install in the expected case. No take_id; our manifest's
+  /// model names and an 8-character revision, closed outcome and fallback strings, Int attempts
+  /// and load_ms, a Bool. No existing row describes an upgrade transition. Reader named on its
+  /// graded registry row (a PostHog query on request; no standing report).
+  /// #3546 A3: a new `coldstart.press_blocked` site (four in all),
+  /// `ColdPressGuard.reconcileParakeetUpgrade`, for a press that lands during the in-session
+  /// Ultra activation. Same meaning and cadence as
+  /// the existing sites (one row per press that minted no session, `warmup_in_flight: true`),
+  /// same properties; the activation runs once per install, so it adds at most a few rows. The
+  /// event's row stays `ungraded`, unchanged.
   static let sitesFingerprint =
-    "448af263db49fd5bbe5a86f4ccfd650fc20077639130445c25605abc4708f9df"
+    "11a6fa6ad2991244fb72566dec0dca4e9c0435b3d576ef4e7f4eace6da84f14e"
   static let ungradedFingerprint =
     "8c5e46c2f2f7fb59004bb2eb5ea1ac210ef32dbb79fdcb68b3eff70a28cc133f"
 

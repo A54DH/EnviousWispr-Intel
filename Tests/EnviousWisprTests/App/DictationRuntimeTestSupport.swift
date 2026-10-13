@@ -72,11 +72,6 @@ final class RouterTestAudioCapture: AudioCaptureInterface {
 
 @MainActor
 final class RouterTestASRManager: ASRManagerInterface {
-  /// #2697: real storage, because the protocol no longer carries a default.
-  /// The default answered an assumed install directory, so a double that never
-  /// set one still reported a usable path. `nil` means nobody has said where the
-  /// model is, which is what a double that loads nothing should say.
-  var parakeetModelDirectory: URL?
   var activeBackendType: ASRBackendType = .parakeet
   var isModelLoaded: Bool = false
   let vendorDecodeOccupancy = VendorDecodeOccupancy()
@@ -96,10 +91,16 @@ final class RouterTestASRManager: ASRManagerInterface {
 
   var activeBackendSupportsStreaming: Bool { get async { false } }
 
-  func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult {
+  func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws -> ASRResult {
     throw RouterTestError.unexpected
   }
-  func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws {
+  func startStreaming(
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws {
     throw RouterTestError.unexpected
   }
   func feedAudio(_ buffer: AVAudioPCMBuffer) async throws {
@@ -137,6 +138,7 @@ enum DictationRuntimeFixtures {
       inputs: .init(
         audioCapture: audioCapture,
         asrManager: asrManager,
+        parakeetUpgrade: .legacyForTesting(),
         vadSignalSource: vad,
         transcriptStore: store,
         keychainManager: KeychainManager(),
@@ -180,7 +182,8 @@ enum DictationRuntimeFixtures {
         captureTelemetry: CaptureTelemetryState(),
         pasteCompletionRegistry: PasteCompletionRegistry(),
         engineMutationScope: .alwaysAllowedForTesting,
-        vendorDecodeOccupancy: VendorDecodeOccupancy()
+        vendorDecodeOccupancy: VendorDecodeOccupancy(),
+        whisperKitModelIdentity: nil
       ))
   }
 
@@ -200,4 +203,17 @@ enum DictationRuntimeFixtures {
     )
   }
 
+}
+
+/// #3546: a Parakeet upgrade coordinator with no delivery handle (the legacy
+/// route), for fixtures that build a Parakeet adapter around a mock manager.
+/// Production builds one in `ModelDeliveryHome.installParakeetUpgrade`.
+extension ParakeetUpgradeCoordinator {
+  @MainActor
+  static func legacyForTesting(
+    selection: ParakeetSelectionProvider = ParakeetSelectionProvider(),
+    delivery: ParakeetDeliveryHandle? = nil
+  ) -> ParakeetUpgradeCoordinator {
+    ParakeetUpgradeCoordinator(parakeetSelection: selection, delivery: delivery)
+  }
 }

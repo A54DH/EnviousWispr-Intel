@@ -279,6 +279,18 @@ package final class WisprBootstrapper {
     // both constructed long before the import coordinator exists, and both have
     // to be able to see a running import.
     weak var fileImportCoordinatorForGates: FileImportCoordinator?
+    // GitHub cloud review, PR #1732: captured by `isDictationActive` below,
+    // assigned once `engineCoordinator` exists. (#3546 A3: declared here, ahead of the
+    // Diagnostics speed test, which also reads its switch gate.) A record
+    // press that has called `beginMinting()` but not yet reached an active
+    // kernel session (still suspended in `preWarm`/the recovery-arm await)
+    // does not make `liveRecordingState.isDictationActive` true — without
+    // this, recovery's per-item scan could reclaim the engine for the next
+    // orphan during exactly that window, and the in-flight press would
+    // abort when its own stale-gate re-check catches up.
+    // `weak`, matching every other cross-reference between these two
+    // coordinators in this file — avoids a retain cycle.
+    weak var engineCoordinatorForRecoveryGate: EngineCoordinator?
     // #1741 — the ONE shared mutation-side capability (§3 construction-
     // topology correction: one value, not one per consumer), threaded through
     // each consumer's required initializer argument as this plan migrates it
@@ -302,7 +314,12 @@ package final class WisprBootstrapper {
     // `EnviousWisprASRService`) is deleted; macOS can no longer reclaim it
     // out from under an idle dictation. The `useXPCASRService` selector and
     // its `defaults write` escape hatch are retired along with it.
-    let asrManager: any ASRManagerInterface = ASRManager(engineMutationScope: engineMutationScope)
+    // #3546: ONE Parakeet load-request provider, handed to the manager here and
+    // to the Parakeet adapter through `ParakeetInputs` below, so every load
+    // reads the request the adapter's warm-up wrote.
+    let parakeetSelection = ParakeetSelectionProvider()
+    let asrManager: any ASRManagerInterface = ASRManager(
+      engineMutationScope: engineMutationScope, parakeetSelection: parakeetSelection)
     // #2787: owns the engine AFTER a session ends with its decode still running.
     let abandonedDecodeHold = AbandonedDecodeHold(
       lease: engineLease, occupancy: asrManager.vendorDecodeOccupancy)
@@ -350,6 +367,15 @@ package final class WisprBootstrapper {
     // own bundle stays the manifest trust root (contract §4a), unchanged.
     let modelDelivery = ModelDeliveryHome(
       engineMutationScope: engineMutationScope, manifestBundle: .main)
+    // #3546: the one Parakeet selection-policy owner, sharing the request
+    // provider `asrManager` was built with above.
+    let parakeetUpgrade = modelDelivery.installParakeetUpgrade(
+      parakeetSelection: parakeetSelection,
+      isOnboardingComplete: { [weak settings] in settings?.onboardingState == .completed })
+    // Usability counts a ready serving Parakeet model, not just its request.
+    parakeetUpgrade.servingReadiness = { [asrManager] in
+      asrManager.activeBackendType == .parakeet && asrManager.isModelLoaded
+    }
 
     // #1707 Phase 2: `whisperKitBackend` is hoisted here (only these two
     // lines — NOT the full `whisperKitKernelDriver`, which still needs
@@ -570,6 +596,7 @@ package final class WisprBootstrapper {
       inputs: KernelDictationDriverFactory.ParakeetInputs(
         audioCapture: audioCapture,
         asrManager: asrManager,
+        parakeetUpgrade: parakeetUpgrade,
         vadSignalSource: vadSource,
         transcriptStore: transcriptStore,
         keychainManager: keychainManager,
@@ -581,7 +608,6 @@ package final class WisprBootstrapper {
         microphonePermissionIsDenied: { permissions.microphonePermissionIsDenied },
         egOneRuntime: egOneRuntime,
         s1MiniRuntime: s1MiniRuntime,
-        parakeetDelivery: modelDelivery.parakeetHandle,
         batchDecodeFaultController: batchDecodeFaultController,
         escapeRecovery: EscapeRecoveryWiring.wire(transcriptCoordinator),
         transcriptionCheckpoint: transcriptionCheckpoint,
@@ -639,6 +665,8 @@ package final class WisprBootstrapper {
         pasteCompletionRegistry: pasteCompletionRegistry,
         engineMutationScope: engineMutationScope,
         vendorDecodeOccupancy: asrManager.vendorDecodeOccupancy,
+        whisperKitModelIdentity: modelDelivery.whisperKitRegistration?.manifest.identity
+          .asrModelIdentity,
         outputClassifierHolder: outputClassifierHolder,
         dictationAudioArchiveOptInProvider: { settings.isDictationAudioArchiveEnabled },
         microphonePermissionIsDenied: { permissions.microphonePermissionIsDenied },
@@ -899,6 +927,27 @@ package final class WisprBootstrapper {
     // #3106 PR B: the late clipboard notice can present from here on. Held strongly by both
     // drivers' callbacks; the director is held weakly by the notice.
     retainedPasteNotice.connect(recordingOverlay)
+    // #3546 A3: the Parakeet Ultra upgrade's downloading and ready pills. Only with the Ultra
+    // target is there an upgrade to show. Chained after the telemetry observer the delivery
+    // home installed, which keeps receiving every outcome first.
+    if let ultraCacheKey = parakeetUpgrade.upgradeTargetCacheKey {
+      let upgradePills = ParakeetUpgradePillPresenter(
+        overlay: recordingOverlay, targetCacheKey: ultraCacheKey,
+        isUltraReady: { [settings, asrManager, parakeetUpgrade] in
+          settings.selectedBackend == .parakeet && asrManager.activeBackendType == .parakeet
+            && asrManager.isModelLoaded && parakeetUpgrade.presentedModel == .ultra
+        })
+      let upstreamOutcome = parakeetUpgrade.onOutcome
+      parakeetUpgrade.onOutcome = { outcome in
+        upstreamOutcome?(outcome)
+        upgradePills.observe(outcome)
+      }
+      let upstreamBackground = parakeetUpgrade.onBackgroundUpgradeChanged
+      parakeetUpgrade.onBackgroundUpgradeChanged = { state in
+        upstreamBackground?(state)
+        upgradePills.backgroundUpgradeChanged(state)
+      }
+    }
 
     // #996 chunk 5h: composed here because every collaborator it needs already
     // exists (settings, the word list, the packs, the overlay director, the
@@ -1021,6 +1070,7 @@ package final class WisprBootstrapper {
     // Restore persisted backend selection synchronously (no race with first record).
     asrManager.setInitialBackendType(settings.selectedBackend)
     SentryBreadcrumb.updateASRBackend(settings.selectedBackend.rawValue)
+    ASRModelScopeOwner.shared.activate(settings.selectedBackend)
 
     // #1173: settings-change telemetry observer. `emitBaseline` re-emits the
     // comprehensive `settings.snapshot` at onboarding-completion (fixes the
@@ -1131,6 +1181,8 @@ package final class WisprBootstrapper {
         }
         // #996 phase D: the judge downloads after first-run setup, never during it.
         learnFromEdits?.onboardingDidComplete()
+        // #3546 E22: a held background Parakeet upgrade starts now.
+        parakeetUpgrade.onboardingDidComplete()
       }
       // #1480: tips on/off, input-device change, and onboarding completion each
       // re-evaluate the Bluetooth card (dismiss/suppress, route re-check, or first
@@ -1155,7 +1207,19 @@ package final class WisprBootstrapper {
     // cold-start delay. Parakeet: shared warm-up via the active driver.
     // WhisperKit: observation-based (waits for setupState to become .ready
     // first, then `preloadAction` → `ensureEngineWarm`).
+    // #3546 row T: Settings' Try again loads right after the granted cycle,
+    // through the same guarded warm-up, only while Parakeet is selected and
+    // active.
+    modelDelivery.warmParakeetAfterExplicitRetry = { [weak kernelDriver, asrManager] in
+      guard settings.selectedBackend == .parakeet,
+        asrManager.activeBackendType == .parakeet
+      else { return }
+      _ = await kernelDriver?.ensureEngineWarm(reason: .explicitRetry)
+    }
+
     if settings.selectedBackend == .parakeet {
+      // #3546: launch is a model-selection point.
+      parakeetUpgrade.markSelectionPoint()
       Task { [weak kernelDriver] in
         // Discard the outcome so the Task's Success type stays Void
         // (`EngineWarmupOutcome` does not declare Sendable conformance).
@@ -1180,7 +1244,8 @@ package final class WisprBootstrapper {
     // and since #2648 file import, which needs the engine the user picked on the
     // Transcription step rather than the one the manager happens to own.
     let activeEngine = ActiveEngineOperation.live(
-      asrManager: asrManager, whisperKitBackend: whisperKitBackend)
+      asrManager: asrManager, parakeetUpgrade: parakeetUpgrade,
+      whisperKitBackend: whisperKitBackend)
 
     // The benchmark is a FOURTH workload on the one inference slot, so it takes
     // the same claim a dictation, a replay and an import take. Built here rather
@@ -1188,7 +1253,8 @@ package final class WisprBootstrapper {
     // pipeline: its job is owning the surface.
     let diagnosticsCoordinator = DiagnosticsCoordinator(
       benchmark: BenchmarkSuite(
-        engineMutationScope: engineMutationScope, engineLease: engineLease))
+        engineMutationScope: engineMutationScope, engineLease: engineLease,
+        isEngineSwitching: { engineCoordinatorForRecoveryGate?.isSwitching ?? false }))
 
     // **Two arguments, and no self-reference problem to solve** (#2292 C3).
     // This used to hand over three closures, one of which resolved the chip's
@@ -1266,17 +1332,6 @@ package final class WisprBootstrapper {
           generation: UInt64(customWordsCoordinator.customWords.count) &+ 1)
       },
       currentSnippets: { [snippetsCoordinator] in snippetsCoordinator.vocabulary })
-    // GitHub cloud review, PR #1732: captured by `isDictationActive` below,
-    // assigned once `engineCoordinator` exists a few lines down. A record
-    // press that has called `beginMinting()` but not yet reached an active
-    // kernel session (still suspended in `preWarm`/the recovery-arm await)
-    // does not make `liveRecordingState.isDictationActive` true — without
-    // this, recovery's per-item scan could reclaim the engine for the next
-    // orphan during exactly that window, and the in-flight press would
-    // abort when its own stale-gate re-check catches up.
-    // `weak`, matching every other cross-reference between these two
-    // coordinators in this file — avoids a retain cycle.
-    weak var engineCoordinatorForRecoveryGate: EngineCoordinator?
     // #1741 Chunk 2 — the recovery-side capability, required at construction
     // (replacing the post-init `tryBeginRecoveryClaim`/`endRecoveryClaim`
     // closure assignments this plan removes below).
@@ -1348,15 +1403,23 @@ package final class WisprBootstrapper {
         // press while the cancelled work is still inside the engine, and a
         // switch admitted in that window unloads the backend underneath it.
         isFileImportRunning: { fileImportCoordinatorForGates?.isEngineHeld ?? false },
+        isEngineHeld: { [engineLease] in engineLease.isBusy },
         isInstalled: { [setup] backend in
           backend == .parakeet ? true : setup.whisperKitSetup.setupState == .ready
         },
         stateLabel: { [kernelDriver, whisperKitKernelDriver] backend in
           (backend == .whisperKit ? whisperKitKernelDriver : kernelDriver).state.telemetryLabel
         },
-        performSwitch: { [asrManager] backend in
+        performSwitch: { [asrManager, parakeetUpgrade] backend in
+          // #3546 E21: an actual transition INTO Parakeet is a selection point;
+          // re-selecting the already-active Parakeet is not.
+          if backend == .parakeet, asrManager.activeBackendType != .parakeet {
+            parakeetUpgrade.markSelectionPoint()
+          }
           await asrManager.switchBackend(to: backend)
           SentryBreadcrumb.updateASRBackend(backend.rawValue)
+          // #3546 §3.7 T3: the model tags follow the engine now active.
+          ASRModelScopeOwner.shared.activate(backend)
         },
         warm: { [kernelDriver, whisperKitKernelDriver] backend in
           await (backend == .whisperKit ? whisperKitKernelDriver : kernelDriver)
@@ -1365,7 +1428,36 @@ package final class WisprBootstrapper {
         // #1707 Phase 3 (§3.2, row 4) / #1741 Chunk 7: `startWarm()`'s
         // background convenience warm must never race recovery on the shared
         // engine — guarded by the one shared `engineMutationScope`.
-        engineMutationScope: engineMutationScope))
+        engineMutationScope: engineMutationScope,
+        // #3546 A3: the in-session Ultra activation at the first quiet moment. Marks the
+        // selection point the next Parakeet load consumes, releases v3 through the same
+        // unload the idle timer uses, then warms; the load's own plan (row A, A-fail, E19)
+        // decides whether Ultra or v3 serves.
+        isParakeetActivationOwed: { [parakeetUpgrade] in parakeetUpgrade.isActivationOwed },
+        activateParakeetUpgrade: { [parakeetUpgrade, asrManager, kernelDriver] in
+          guard parakeetUpgrade.beginOwedActivation() else { return }
+          // An idle-unload timer firing mid-load would cancel the Ultra load it lands on.
+          kernelDriver.cancelPendingEngineUnload()
+          await asrManager.unloadModel()
+          // The quiet gates exclude a live stream and recovery, the unload's only two
+          // refusals. If v3 is somehow still resident, load nothing now: the marked
+          // selection point waits for the next real load, so two models never load.
+          guard !asrManager.isModelLoaded else {
+            await AppLogger.shared.log(
+              "Parakeet upgrade activation: v3 unload refused; Ultra waits for the next load",
+              level: .info, category: "Upgrade")
+            return
+          }
+          _ = await kernelDriver.ensureEngineWarm(reason: .engineSwap)
+        }))
+    parakeetUpgrade.onActivationOwed = { [weak engineCoordinator] in
+      engineCoordinator?.poke(.parakeetUpgradeOwed)
+    }
+    // #3546 A3: an activation deferred because the engine lease was held (a speed test, a
+    // decode still finishing for an abandoned take) is offered again when it is released.
+    engineLease.onReleased = { [weak engineCoordinator] in
+      engineCoordinator?.poke(.parakeetUpgradeOwed)
+    }
     // GitHub cloud review, PR #1732: now that `engineCoordinator` exists,
     // `isDictationActive` (wired above) can read its minting state.
     engineCoordinatorForRecoveryGate = engineCoordinator
@@ -1427,7 +1519,8 @@ package final class WisprBootstrapper {
       llmDiscovery: llmDiscovery,
       // The coordinator's published snapshot covers BOTH engines; the manager's
       // own flag is Parakeet-only since #1386 (cloud review P2).
-      activeModelLoaded: { [engineCoordinator] in engineCoordinator.status.activeModelLoaded }
+      activeModelLoaded: { [engineCoordinator] in engineCoordinator.status.activeModelLoaded },
+      parakeetModelLabel: { [modelDelivery] in modelDelivery.parakeetModelLabel }
     )
     // PR9 of #763: construct the lifecycle home BEFORE DictationRuntime.
     // PR-C.3: the hands-free lock flag is rehomed onto `LiveRecordingState`.
@@ -1555,7 +1648,11 @@ package final class WisprBootstrapper {
         }
         return engineCoordinator.status.selectedInstalled
       },
-      endMinting: { [weak engineCoordinator] in engineCoordinator?.endMinting() }
+      endMinting: { [weak engineCoordinator] in engineCoordinator?.endMinting() },
+      // #3546 A3: a press during the in-session Ultra activation gets the upgrade pills.
+      isActivatingParakeetUpgrade: { [weak engineCoordinator] in
+        engineCoordinator?.isActivatingParakeetUpgrade ?? false
+      }
     )
 
     // PR-B.3 of #763: menu bar surface home.
@@ -1698,10 +1795,14 @@ package final class WisprBootstrapper {
           checkerEligibility?.wordCheck?.isWantedForTelemetry ?? false
         )
       },
-      emit: { sample in
+      emit: { [asrManager, kernelDriver, whisperKitKernelDriver] sample in
         TelemetryService.shared.appIdleMemory(
           footprintMB: sample.footprintMB, minutesSinceLaunch: sample.minutesSinceLaunch,
-          wordCheckLoaded: sample.wordCheckLoaded, wordCheckWanted: sample.wordCheckWanted)
+          wordCheckLoaded: sample.wordCheckLoaded, wordCheckWanted: sample.wordCheckWanted,
+          // #3546 §3.7 T1: the active engine's loaded model, nil when none is loaded.
+          model: asrManager.activeBackendType == .whisperKit
+            ? whisperKitKernelDriver.servingModelAttribution
+            : kernelDriver.servingModelAttribution)
       })
     idleMemoryObserver.start()
     idleMemoryObserverForSettings = idleMemoryObserver
@@ -1808,7 +1909,7 @@ package final class WisprBootstrapper {
       // the claim precisely so the switch it may trigger is not deferred by the
       // claim. A second loader here would be a second answer to the same
       // question, which is the shape that produced this feature's first defect.
-      transcribe: { [activeEngine, settings] samples, onProgress in
+      transcribe: { [activeEngine, settings] samples, onProgress, onInferenceEntered in
         var options = TranscriptionOptions.default
         if case .locked(let code) = settings.languageMode { options.language = code }
         // The engine's own language answer travels with the words. Reducing this
@@ -1821,7 +1922,8 @@ package final class WisprBootstrapper {
         // on both exits, so a dictation that follows never inherits the import's sink.
         await activeEngine.setTranscriptionProgressObserver(onProgress)
         do {
-          let result = try await activeEngine.transcribe(samples, options)
+          // #3546 §3.7 T1: the run's own inference observation travels with this call.
+          let result = try await activeEngine.transcribe(samples, options, onInferenceEntered)
           await activeEngine.setTranscriptionProgressObserver(nil)
           return result
         } catch {
@@ -1855,11 +1957,11 @@ package final class WisprBootstrapper {
       },
       // #3069: which engine, whether it and the configured polisher succeeded.
       emitRunTelemetry: {
-        outcome, backend, durationSeconds, asrOutcome, polishOutcome, provider, model in
+        outcome, backend, asrModel, durationSeconds, asrOutcome, polishOutcome, provider, model in
         TelemetryService.shared.trackFileImportCompleted(
-          outcome: outcome, asrBackend: backend, durationSeconds: durationSeconds,
-          asrOutcome: asrOutcome, polishOutcome: polishOutcome, polishProvider: provider,
-          polishModel: model)
+          outcome: outcome, asrBackend: backend, model: asrModel,
+          durationSeconds: durationSeconds, asrOutcome: asrOutcome, polishOutcome: polishOutcome,
+          polishProvider: provider, polishModel: model)
       },
       // #3069: same `.asrFailed` category and fingerprint dictation's own ASR failures use
       // (one engine defect, one Sentry issue), tagged `stage: "file_import"` so it is
@@ -1910,7 +2012,6 @@ package final class WisprBootstrapper {
       // the adapters covers both engines rather than one of them twice.
       // Idempotent, so both are always touched rather than whichever looks
       // active.
-      engineIsLoaded: { [activeEngine] in await activeEngine.isLoaded() },
       disarmEngineTimers: { [kernelDriver, whisperKitKernelDriver] in
         kernelDriver.cancelPendingEngineUnload()
         whisperKitKernelDriver.cancelPendingEngineUnload()
@@ -1918,6 +2019,9 @@ package final class WisprBootstrapper {
       rearmEngineTimers: { [kernelDriver, whisperKitKernelDriver, settings] in
         kernelDriver.applyEngineUnloadPolicy(settings.modelUnloadPolicy)
         whisperKitKernelDriver.applyEngineUnloadPolicy(settings.modelUnloadPolicy)
+      },
+      engineSelectionSettled: { [settings, asrManager] in
+        settings.selectedBackend == asrManager.activeBackendType
       },
       ensureEngineReady: { [weak engineCoordinator, activeEngine] in
         guard let engineCoordinator else { return .notReady }
@@ -1972,7 +2076,9 @@ package final class WisprBootstrapper {
       // import started after the user adds a word should use it.
       // The wizard's steps WRITE settings when the user picks, so freezing
       // settings here freezes exactly what the user chose on those screens.
-      beginRun: { [settings, customWordsPropagator, localPolishRuntimes] in
+      beginRun: {
+        [settings, customWordsPropagator, localPolishRuntimes, kernelDriver, whisperKitKernelDriver]
+        in
         let snapshot = FileImportSettingsFreeze.snapshot(settings: settings)
         fileImportRunner.freeze(settings: snapshot, vocabulary: customWordsPropagator.corrector)
         // #3289: Start and Clean it again both come through here, after the claim; preload the word
@@ -1981,10 +2087,16 @@ package final class WisprBootstrapper {
         checkerEligibility.wordCheck?.fileImportStarted(
           needsWordCheck: LearnedWordCheckerEngine(
             provider: LLMProvider(rawValue: snapshot.llmProvider) ?? .none) == nil)
-        let configuration = FileImportSettingsFreeze.configuration(
+        var configuration = FileImportSettingsFreeze.configuration(
           for: snapshot,
           ollamaModelIsRemote: snapshot.llmProvider == LLMProvider.ollama.rawValue
             ? ollamaRemoteness(snapshot.llmModel) : false)
+        // #3546 §3.7 T1: the frozen engine's serving model, read at the same freeze.
+        configuration.asrModel = FileImportSettingsFreeze.frozenASRModel(
+          backend: configuration.backendType,
+          parakeetServing: kernelDriver.servingModelAttribution,
+          whisperKitServing: whisperKitKernelDriver.servingModelAttribution,
+          whisperKitValidated: whisperKitKernelDriver.requestedModelAttribution)
         // #2772: **the import starts its OWN bundled polisher.**
         //
         // Since the import's polisher is chosen independently of dictation's, EG-1 can be
@@ -2077,10 +2189,15 @@ package final class WisprBootstrapper {
     // outlasts Stop), with the need read from the run's FROZEN provider. Wired here, after the
     // coordinator exists, so the closure can see it.
     checkerEligibility.wordCheck?.inFlightWorkNeedsWordCheck = {
-      [weak kernelDriver, weak whisperKitKernelDriver, weak fileImportCoordinator, weak fileImportRunner] in
+      [
+        weak kernelDriver, weak whisperKitKernelDriver, weak fileImportCoordinator,
+        weak fileImportRunner
+      ] in
       WordCheckRuntime.workNeedsWordCheck(
-        dictationProviders: [kernelDriver?.currentSessionConfig, whisperKitKernelDriver?.currentSessionConfig]
-          .compactMap { $0?.llmProvider },
+        dictationProviders: [
+          kernelDriver?.currentSessionConfig, whisperKitKernelDriver?.currentSessionConfig,
+        ]
+        .compactMap { $0?.llmProvider },
         importHoldsEngine: fileImportCoordinator?.isEngineHeld == true,
         importProvider: fileImportRunner?.frozenLLMProvider)
     }
@@ -2517,12 +2634,15 @@ private struct MainWindowRoot: View {
       .environment(b.audioDeviceList)
       // Only the microphone status view invokes this reader and observes capture changes.
       // No second state owner or capture command; the diagnostic UID survives stop.
-      .environment(\.microphoneCapturePresentation, {
-        MicrophoneCapturePresentation(
-          isCapturing: b.liveRecordingState.audioCapture.isCapturing,
-          boundDeviceUID:
-            b.liveRecordingState.audioCapture.zeroSignalDiscriminatorDevice?.deviceUID)
-      })
+      .environment(
+        \.microphoneCapturePresentation,
+        {
+          MicrophoneCapturePresentation(
+            isCapturing: b.liveRecordingState.audioCapture.isCapturing,
+            boundDeviceUID:
+              b.liveRecordingState.audioCapture.zeroSignalDiscriminatorDevice?.deviceUID)
+        }
+      )
       .environment(b.aiAvailability)
       .environment(b.llmDiscovery)
       .environment(b.polishSetup.savedKeyPresence)
@@ -2557,6 +2677,8 @@ private struct OnboardingWindowRoot: View {
     .environment(b.navigationCoordinator)
     .environment(b.languageSuggestionPresenter)
     .environment(b.dictationRuntime)
+    // #3546: the warming screen's retry reaches the Parakeet upgrade policy.
+    .environment(b.modelDelivery)
     // #2196 — the practice screen reads BOTH of these, and a type-based
     // `@Environment` with no default TRAPS AT RUNTIME rather than failing to
     // compile. Cloud review caught this as a P1: `liveRecordingState` was added

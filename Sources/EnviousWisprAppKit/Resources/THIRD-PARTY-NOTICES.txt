@@ -257,7 +257,7 @@ The full text of the Apache License, Version 2.0 follows.
 
 --------------------------------------------------------------------------------
 FluidAudio
-  Version: b29591ad (fork saurabhav88/FluidAudio)
+  Version: fb506037 (fork saurabhav88/FluidAudio)
   License: Apache-2.0
   Source:  https://github.com/saurabhav88/FluidAudio
 --------------------------------------------------------------------------------
@@ -1772,63 +1772,6 @@ limitations under the License.
 
 
 --------------------------------------------------------------------------------
-NemoTextProcessing / text-processing-rs (bundled in FluidAudio)
-  Version: v0.3.0
-  License: Apache-2.0 (aggregating Apache-2.0/MIT components)
-  Source:  https://github.com/FluidInference/text-processing-rs
---------------------------------------------------------------------------------
-
-# NemoTextProcessing (text-processing-rs)
-
-The `NemoTextProcessing` binary target is the prebuilt xcframework of
-[`text-processing-rs`](https://github.com/FluidInference/text-processing-rs)
-(v0.3.0), used by `NemoTextNormalizer` for byte-exact NeMo text normalization.
-
-- **Source:** https://github.com/FluidInference/text-processing-rs
-- **License:** Apache License, Version 2.0
-
-Built with the `fst-engine` feature, the xcframework includes and statically
-links the following third-party works. All are permissive (Apache-2.0 / MIT)
-and compatible.
-
-## NVIDIA NeMo Text Processing
-
-The compiled weighted-FST grammars and text-normalization fixtures are derived
-from / copied from NVIDIA NeMo Text Processing (pinned commit
-`1f1263579fe57ba7ed783cad3dddee710fcc5064`).
-
-- **Source:** https://github.com/NVIDIA/NeMo-text-processing
-- **License:** Apache License, Version 2.0
-- **Copyright:** Copyright (c) NVIDIA CORPORATION & AFFILIATES.
-
-## rustfst
-
-Loads and executes the compiled OpenFST grammars.
-
-- **Source:** https://github.com/Garvys/rustfst
-- **License:** MIT OR Apache-2.0
-- **Copyright:** Copyright (c) Alexandre Caulier and the rustfst contributors.
-
-## flate2
-
-Decompresses the bundled gzipped grammars at load time.
-
-- **Source:** https://github.com/rust-lang/flate2-rs
-- **License:** MIT OR Apache-2.0
-- **Copyright:** Copyright (c) Alex Crichton and the flate2 contributors.
-
-## Other Rust dependencies
-
-The xcframework transitively links additional permissive-licensed Rust crates
-(MIT and/or Apache-2.0) via `rustfst` and `flate2` — e.g. `nom`,
-`miniz_oxide`, `bitflags`, `anyhow`. See the crate's `THIRD-PARTY-LICENSES.md`
-for detail.
-
-Full texts: Apache-2.0 <https://www.apache.org/licenses/LICENSE-2.0>,
-MIT <https://opensource.org/license/mit>.
-
-
---------------------------------------------------------------------------------
 PLCrashReporter + protobuf-c (bundled in PostHog)
   Version: n/a
   License: MIT / Apache-2.0 / BSD-2-Clause
@@ -3217,10 +3160,30 @@ SPDX-License-Identifier: Unicode-3.0
 Speech recognition model (downloaded at runtime, NOT bundled in this DMG)
 --------------------------------------------------------------------------------
 
-EnviousWispr downloads the Parakeet TDT speech model (CoreML) from Hugging
-Face on first use; it is not distributed inside this disk image. The model
-is provided under CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/).
-Source: https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml
+Parakeet Ultra (CoreML)
+  Version: Hugging Face revision 95eaa59a (FluidInference/parakeet-ultra-coreml)
+  License: CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)
+  Source:  https://huggingface.co/FluidInference/parakeet-ultra-coreml
+
+EnviousWispr downloads this speech model on first use, or in the background
+for existing users; it is not distributed inside this disk image. The files
+are served from models.enviouswispr.com, with the Hugging Face revision above
+as a backup source. Attribution:
+  - Base model: nvidia/parakeet-tdt-0.6b-v3 by NVIDIA, CC-BY-4.0
+    (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+  - Post-training: moondream/parakeet-ultra by moondream, CC-BY-4.0
+    (https://huggingface.co/moondream/parakeet-ultra)
+  - Core ML conversion: FluidInference/parakeet-ultra-coreml by FluidInference,
+    CC-BY-4.0 (https://huggingface.co/FluidInference/parakeet-ultra-coreml)
+Envious Labs did not modify the model. To fit our download cache, the encoder
+weights file is transferred in two pieces that the app joins back together;
+the installed file is byte-identical to the publisher's file and is checked
+against its published SHA-256 before use.
+
+Earlier versions used Parakeet TDT 0.6B v3 (CoreML), CC-BY-4.0, from
+https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml (base model
+nvidia/parakeet-tdt-0.6b-v3 by NVIDIA). An existing copy keeps working until
+Parakeet Ultra is ready, and is then removed.
 
 --------------------------------------------------------------------------------
 S1-mini by Superwhisper (polish model, downloaded at runtime from Envious Labs)

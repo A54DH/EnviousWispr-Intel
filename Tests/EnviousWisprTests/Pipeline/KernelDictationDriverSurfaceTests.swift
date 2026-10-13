@@ -50,6 +50,7 @@ import Testing
       let inputs = KernelDictationDriverFactory.ParakeetInputs(
         audioCapture: audio,
         asrManager: StubParakeetASRManager(),
+        parakeetUpgrade: .legacyForTesting(),
         vadSignalSource: vad,
         transcriptStore: TranscriptStore(),
         keychainManager: KeychainManager(),

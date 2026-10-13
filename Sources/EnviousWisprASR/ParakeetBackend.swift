@@ -7,12 +7,11 @@ import os
 // Disambiguate from FluidAudio.ASRResult — we always mean our own type.
 public typealias ASRResult = EnviousWisprCore.ASRResult
 
-/// Parakeet v3 ASR backend using FluidAudio/CoreML.
+/// Parakeet ASR backend using FluidAudio/CoreML.
 ///
-/// This is the primary (default) backend. Parakeet v3 provides:
-/// - ~110x real-time factor on Apple Silicon
-/// - Built-in punctuation and capitalization
-/// - 25 European language support
+/// This is the primary (default) backend. It loads the model the upgrade policy
+/// selects (#3546): Parakeet Ultra, or Parakeet v3 while an install upgrades.
+/// Both write their own punctuation and capitalization.
 public actor ParakeetBackend: ASRBackend {
   public private(set) var isReady = false
 
@@ -34,6 +33,54 @@ public actor ParakeetBackend: ASRBackend {
 
   // Streaming ASR state
   private var streamingManager: SlidingWindowAsrManager?
+
+  /// #3546 A3: retired streams remain in use until their recognizer tasks finish. The vendor
+  /// `cancel()` requests completion; it does not prove it. Each retired stream's `finish()`
+  /// awaits its recognizer task (after `cancel()` the task flushes what it already holds and
+  /// starts nothing new), chained so one handle covers every retired stream, and `unload()`
+  /// waits for the chain before it releases the model, so an in-session model switch does not
+  /// load the new model while the old one is still running.
+  private var streamingDrain: Task<Void, Never>?
+
+  /// Hang guard for `unload()`'s wait on the drain, not a latency budget. The chain may cover
+  /// several retired streams, each flushing the audio it already holds. `unload()` waits for
+  /// the chain up to this guard. Past it, it releases its own model references under the
+  /// founder-approved best-effort policy (#3546 A3, #3680); an outstanding stream may still
+  /// retain the old models.
+  private static let streamingDrainDeadlineSeconds = 5.0
+
+  /// Cancels `manager` and adds its drain to the chain `unload()` waits for. The drain is
+  /// published before the first suspension, so an `unload()` that runs while this cancel is
+  /// in flight already sees it. Callers wait for the cancel, not the whole drain.
+  private func retireStreaming(_ manager: SlidingWindowAsrManager) async {
+    let retirement = Self.chainRetirement(
+      previous: streamingDrain,
+      cancel: { await manager.cancel() },
+      finish: { _ = try? await manager.finish() })
+    streamingDrain = retirement.drain
+    await retirement.cancellation.value
+  }
+
+  /// One retirement: `finish` starts as soon as this stream's own `cancel` completes, never
+  /// behind an older stream's drain, so one drain that never returns cannot hold every later
+  /// stream (and its audio and model references) with it. The returned `drain` completes
+  /// when this finish and every earlier drain have.
+  static func chainRetirement(
+    previous: Task<Void, Never>?,
+    cancel: @escaping @Sendable () async -> Void,
+    finish: @escaping @Sendable () async -> Void
+  ) -> (cancellation: Task<Void, Never>, drain: Task<Void, Never>) {
+    let cancellation = Task { await cancel() }
+    let finished = Task {
+      await cancellation.value
+      await finish()
+    }
+    let drain = Task {
+      await previous?.value
+      await finished.value
+    }
+    return (cancellation, drain)
+  }
   private var streamingStartTime: CFAbsoluteTime = 0
   /// #1908 round 10: which generation `streamingManager` was published
   /// under, so `reclaimIfPublished(generation:)` can tell "the exact
@@ -141,7 +188,7 @@ public actor ParakeetBackend: ASRBackend {
     guard publishedStreamingGeneration == generation, let manager = streamingManager else { return }
     streamingManager = nil
     publishedStreamingGeneration = nil
-    await manager.cancel()
+    await retireStreaming(manager)
   }
 
   public var supportsStreaming: Bool { true }
@@ -151,7 +198,29 @@ public actor ParakeetBackend: ASRBackend {
   /// 483,256,769 bytes — byte-verified in `workers/parakeet-mirror/
   /// expected-manifest.json` (in-repo since #1348 PR-2a; the bundled
   /// `parakeet-delivery-manifest.json` derives from it).
-  static let totalDownloadMB = 483
+  /// #3546: no longer a literal 483. The figure comes from the load request's
+  /// `displayBytes` (the manifest's `totalBytes`, or
+  /// `ParakeetModel.v3ShippedBytes` when no manifest loaded), in decimal MB,
+  /// so 483,256,769 bytes still reads "483 MB".
+  static func totalDownloadMB(displayBytes: Int64) -> Int {
+    Int(displayBytes / 1_000_000)
+  }
+
+  /// #3546: the ONLY place a `ParakeetModel` becomes a FluidAudio version, so
+  /// Pipeline never needs to import FluidAudio.
+  static func vendorVersion(for model: ParakeetModel) -> AsrModelVersion {
+    switch model {
+    case .v3: return .v3
+    case .ultra: return .ultra
+    }
+  }
+
+  /// The folder FluidAudio reconstructs for `model` (#3546): the ORACLE for
+  /// `ParakeetInstallLocation.folderName(for:)`, read from the vendor at
+  /// runtime, exactly as `vendorSharedDirectory` is for v3. Never a location.
+  package static func vendorFolderName(for model: ParakeetModel) -> String {
+    AsrModels.defaultCacheDirectory(for: vendorVersion(for: model)).lastPathComponent
+  }
 
   public init() {}
 
@@ -173,7 +242,7 @@ public actor ParakeetBackend: ASRBackend {
   ///
   /// They used to resolve a location themselves, which is how a caller that
   /// never passed one still got a model — from a directory nobody had verified.
-  /// `ASRManager` reaches the real `prepare(cacheOnly:modelDirectory:)` for every
+  /// `ASRManager` reaches the real `prepare(selection:progressCallback:)` for every
   /// production load, so these two are only reachable by a caller that has not
   /// said where the model lives, and the honest answer to that is an error.
   public func prepare() async throws {
@@ -223,10 +292,16 @@ public actor ParakeetBackend: ASRBackend {
   ///   path identically (`AsrModels.load(from:)` re-derives it through
   ///   `repoPath`, and `download(to:)` derives its own parent), so passing
   ///   a repo-shaped path here behaves identically either way.
-  public func prepare(
-    cacheOnly: Bool, modelDirectory: URL, progressCallback: ProgressCallback?
+  /// #3546: both now arrive in ONE request, `selection.cacheOnly` and
+  /// `selection.directory`, with the model version and the progress size.
+  package func prepare(
+    selection: ParakeetModelSelection, progressCallback: ProgressCallback?
   ) async throws {
-    let handler = Self.makeLoadProgressHandler(progressCallback)
+    let cacheOnly = selection.cacheOnly
+    let modelDirectory = selection.directory
+    let version = Self.vendorVersion(for: selection.model)
+    let handler = Self.makeLoadProgressHandler(
+      totalDownloadMB: Self.totalDownloadMB(displayBytes: selection.displayBytes), progressCallback)
 
     Self.configureOfflineMode(cacheOnly: cacheOnly)
     do {
@@ -236,10 +311,10 @@ public actor ParakeetBackend: ASRBackend {
         // gate before this call; offlineMode (armed above) turns any gap
         // into a typed throw the host maps to its repair path.
         loadedModels = try await AsrModels.load(
-          from: modelDirectory, version: .v3, progressHandler: handler)
+          from: modelDirectory, version: version, progressHandler: handler)
       } else {
         loadedModels = try await AsrModels.downloadAndLoad(
-          to: modelDirectory, version: .v3, progressHandler: handler)
+          to: modelDirectory, version: version, progressHandler: handler)
       }
       self.fluidModels = loadedModels
 
@@ -273,7 +348,7 @@ public actor ParakeetBackend: ASRBackend {
   /// owner, identical control flow (#1981 chunk 2; the test feeds real
   /// `DownloadProgress` values through THIS function, not a copy).
   static func makeLoadProgressHandler(
-    _ progressCallback: ProgressCallback?
+    totalDownloadMB: Int, _ progressCallback: ProgressCallback?
   ) -> ProgressHandler? {
     progressCallback.map {
       callback -> ProgressHandler in
@@ -294,9 +369,9 @@ public actor ParakeetBackend: ASRBackend {
           // old "23 MB" label was the decoder file alone. Fraction [0, 0.5]
           // is FluidAudio's byte-weighted download half.
           let downloadPct = min(progress.fractionCompleted * 2.0, 1.0)
-          let downloadedMB = Int(downloadPct * Double(Self.totalDownloadMB))
+          let downloadedMB = Int(downloadPct * Double(totalDownloadMB))
           detail =
-            "\(downloadedMB) MB of \(Self.totalDownloadMB) MB (\(Int(downloadPct * 100))%)"
+            "\(downloadedMB) MB of \(totalDownloadMB) MB (\(Int(downloadPct * 100))%)"
         case .compiling(let modelName):
           // Single authority for this token too (#1388): the host-side
           // watcher's install OBSERVATION keys on it for the warm-up success
@@ -309,9 +384,10 @@ public actor ParakeetBackend: ASRBackend {
     }
   }
 
-  public func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws
-    -> ASRResult
-  {
+  public func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws -> ASRResult {
     // #2918: captured and cleared before the readiness guard, so a refused call leaves
     // nothing installed for the next caller (same ordering as WhisperKit).
     let progressObserver = transcriptionProgressObserver
@@ -380,6 +456,11 @@ public actor ParakeetBackend: ASRBackend {
       let batchDecodeFaultRole = await enterBatchDecodeFaultBoundary()
       defer { exitBatchDecodeFaultBoundary(role: batchDecodeFaultRole) }
     #endif
+    // #3546 §3.7 T1: the entry is committed here, after every preparatory await and the
+    // last cancellation check, with no suspension before the vendor call. Outside the
+    // `do` so a cancellation stays a cancellation.
+    try Task.checkCancellation()
+    onInferenceEntered?()
     do {
       let fluidResult = try await manager.transcribe(
         audioSamples, decoderState: &decoderState, language: languageHint)
@@ -517,7 +598,8 @@ public actor ParakeetBackend: ASRBackend {
   /// `cancelInFlightStreamingStart()` — see `startStreaming(options:generation:)`
   /// below), any caller (tests included) can use this directly.
   public func startStreaming(options: TranscriptionOptions) async throws {
-    try await startStreaming(options: options, generation: reserveStreamingGeneration())
+    try await startStreaming(
+      options: options, generation: reserveStreamingGeneration(), onWindowInferenceEntered: nil)
   }
 
   /// #1908 round 8: takes an ALREADY-RESERVED generation rather than
@@ -540,7 +622,12 @@ public actor ParakeetBackend: ASRBackend {
   /// (actor isolation guarantees only one runs at a time until it suspends)
   /// gets the strictly-earlier number, and every check below then correctly
   /// recognizes a call that started before a newer one as superseded.
-  func startStreaming(options: TranscriptionOptions, generation myGeneration: UInt64) async throws {
+  /// #3546 §3.7 T1: `onWindowInferenceEntered` goes to this attempt's own vendor manager
+  /// (observation only; see `ASRManagerInterface.startStreaming`).
+  func startStreaming(
+    options: TranscriptionOptions, generation myGeneration: UInt64,
+    onWindowInferenceEntered: ASRInferenceEntryObserver?
+  ) async throws {
     guard isReady, let models = fluidModels else { throw ASRError.notReady }
 
     // Cancel any existing streaming session before starting a new one.
@@ -548,7 +635,7 @@ public actor ParakeetBackend: ASRBackend {
     if let existing = streamingManager {
       streamingManager = nil
       publishedStreamingGeneration = nil
-      await existing.cancel()
+      await retireStreaming(existing)
     }
     guard streamingGeneration.withLock({ $0 == myGeneration }) else { throw CancellationError() }
 
@@ -557,23 +644,24 @@ public actor ParakeetBackend: ASRBackend {
     // the other, with nothing in the UI to say which they were on.
     let config = SlidingWindowAsrConfig.streaming
       .applying(language: Self.fluidLanguage(for: options.language))
-    let manager = SlidingWindowAsrManager(config: config)
+    let manager = SlidingWindowAsrManager(
+      config: config, onWindowInferenceEntered: onWindowInferenceEntered)
     do {
       // Vendor API: streaming starts via loadModels(_:) then startStreaming(source:).
       try await manager.loadModels(models)
       guard streamingGeneration.withLock({ $0 == myGeneration }) else {
-        await manager.cancel()
+        await retireStreaming(manager)
         throw CancellationError()
       }
       try await manager.startStreaming(source: .microphone)
     } catch is CancellationError {
-      await manager.cancel()
+      await retireStreaming(manager)
       throw CancellationError()
     } catch {
       // #1654: pin a stable identity before this leaves the service. A cancellation is
       // deliberately excluded above rather than classified — a cancelled stream is not a
       // failure and must never acquire a failure identity.
-      await manager.cancel()
+      await retireStreaming(manager)
       throw Self.streamingThrowable(for: error, operation: .start)
     }
     // #1908: a caller that abandoned this attempt (deadline expiry, via
@@ -607,7 +695,7 @@ public actor ParakeetBackend: ASRBackend {
       return true
     }
     guard published else {
-      await manager.cancel()
+      await retireStreaming(manager)
       throw CancellationError()
     }
   }
@@ -713,7 +801,7 @@ public actor ParakeetBackend: ASRBackend {
     if let manager = streamingManager {
       streamingManager = nil
       publishedStreamingGeneration = nil
-      await manager.cancel()
+      await retireStreaming(manager)
     }
   }
 
@@ -724,7 +812,20 @@ public actor ParakeetBackend: ASRBackend {
     if let streaming = streamingManager {
       streamingManager = nil
       publishedStreamingGeneration = nil
-      await streaming.cancel()
+      await retireStreaming(streaming)
+    }
+    // #3546 A3: every stream retired before this point, including ones cancelled by
+    // `cancelStreaming()` or an abandoned start that already gave up, stops using the model
+    // first. A start still inside the vendor load is not waited for (it may never return);
+    // it sees the bumped generation and retires its own stream.
+    if let drain = streamingDrain {
+      if await withDeadline(seconds: Self.streamingDrainDeadlineSeconds, operation: {
+        await drain.value
+      }) == nil {
+        await AppLogger.shared.log(
+          "Parakeet unload: a cancelled stream did not drain within the deadline",
+          level: .info, category: "ASR")
+      }
     }
     await fluidAsrManager?.cleanup()
     fluidAsrManager = nil

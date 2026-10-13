@@ -1,4 +1,5 @@
 import EnviousWisprASR
+import EnviousWisprCore
 import Foundation
 
 /// The single concrete `ASREngineAdapter` construction owner (epic #827, PR-6).
@@ -26,16 +27,18 @@ import Foundation
 package enum KernelAdapterFactory {
 
   /// The single Parakeet adapter construction site in `Sources/`.
-  /// `delivery` (#1348 Phase 2): nil = legacy in-service download path.
+  /// `parakeetUpgrade` (#3546): required; the Parakeet selection-policy owner,
+  /// which holds the delivery handle (#1348 Phase 2) and the request provider
+  /// `ASRManager` reads.
   /// `batchDecodeFaultController` (#1707 Phase 2): DEBUG fault-injection
   /// oracle, defaulted `nil` so every existing test call site is unaffected.
   package static func makeParakeetAdapter(
     asrManager: any ASRManagerInterface,
-    delivery: ParakeetDeliveryHandle? = nil,
+    parakeetUpgrade: ParakeetUpgradeCoordinator,
     batchDecodeFaultController: BatchDecodeFaultController? = nil
   ) -> any ASREngineAdapter {
     ParakeetEngineAdapter(
-      asrManager: asrManager, delivery: delivery,
+      asrManager: asrManager, parakeetUpgrade: parakeetUpgrade,
       batchDecodeFaultController: batchDecodeFaultController)
   }
 
@@ -51,6 +54,7 @@ package enum KernelAdapterFactory {
     audioCaptureSessionIDSource: @escaping @MainActor () -> UInt64,
     engineMutationScope: EngineMutationScope,
     vendorDecodeOccupancy: VendorDecodeOccupancy,
+    deliveredModelIdentity: ASRModelIdentity?,
     batchDecodeFaultController: BatchDecodeFaultController? = nil
   ) -> any ASREngineAdapter {
     WhisperKitEngineAdapter(
@@ -59,6 +63,7 @@ package enum KernelAdapterFactory {
       languageDetector: languageDetector,
       audioCaptureSessionIDSource: audioCaptureSessionIDSource,
       vendorDecodeOccupancy: vendorDecodeOccupancy,
-      batchDecodeFaultController: batchDecodeFaultController)
+      batchDecodeFaultController: batchDecodeFaultController,
+      deliveredModelIdentity: deliveredModelIdentity)
   }
 }

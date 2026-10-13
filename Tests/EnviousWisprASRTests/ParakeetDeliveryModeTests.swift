@@ -45,7 +45,12 @@ import Testing
       }
     }
     let box = Box()
-    let handler = ParakeetBackend.makeLoadProgressHandler { fraction, phase, detail in
+    // #3546: the size now comes from the load request's bytes. The shipped v3
+    // total must still read as 483 MB (literal oracle, not the conversion).
+    let totalMB = ParakeetBackend.totalDownloadMB(displayBytes: ParakeetModel.v3ShippedBytes)
+    #expect(totalMB == 483)
+    let handler = ParakeetBackend.makeLoadProgressHandler(totalDownloadMB: totalMB) {
+      fraction, phase, detail in
       box.append((fraction, phase, detail))
     }
     guard let handler else {
@@ -53,7 +58,7 @@ import Testing
       return
     }
     // nil callback maps to nil handler (skip the closure allocation entirely).
-    #expect(ParakeetBackend.makeLoadProgressHandler(nil) == nil)
+    #expect(ParakeetBackend.makeLoadProgressHandler(totalDownloadMB: totalMB, nil) == nil)
 
     // The four real ProgressReporter shapes for a repo load (downloadPhaseWeight 0.5):
     handler(DownloadProgress(fractionCompleted: 0.0, phase: .listing))
@@ -83,5 +88,26 @@ import Testing
     #expect(emissions[3].0 == 1.0)
     #expect(emissions[3].1 == ModelLoadStallPolicy.installPhase)
     #expect(emissions[3].2 == "")
+  }
+
+  /// #3546: our install folder for each model must be the folder FluidAudio
+  /// rebuilds for it (`AsrModels.load(from:)` drops the last component and
+  /// re-appends the vendor's folder name), read from the vendor at runtime, and
+  /// v3's must stay the name existing installs already use.
+  @Test(arguments: ParakeetModel.allCases)
+  func installFolderMatchesTheVendorReconstruction(model: ParakeetModel) {
+    #expect(
+      ParakeetInstallLocation.folderName(for: model)
+        == ParakeetBackend.vendorFolderName(for: model))
+    let data = URL(fileURLWithPath: "/tmp/ew-folder-oracle/EnviousWispr")
+    #expect(
+      ParakeetInstallLocation.directory(for: model, dataDirectory: data).lastPathComponent
+        == ParakeetInstallLocation.folderName(for: model))
+    if model == .v3 {
+      #expect(ParakeetInstallLocation.folderName(for: model) == "parakeet-tdt-0.6b-v3")
+      #expect(
+        ParakeetInstallLocation.directory(dataDirectory: data)
+          == ParakeetInstallLocation.directory(for: .v3, dataDirectory: data))
+    }
   }
 }

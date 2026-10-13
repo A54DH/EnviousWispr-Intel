@@ -30,9 +30,10 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
   // MARK: Injected dependency
 
   private let asrManager: any ASRManagerInterface
-  /// #1348 Phase 2: the delivery stage that runs before any Parakeet load —
-  /// nil means the legacy in-service download path (tests, or the flag off).
-  private let delivery: ParakeetDeliveryHandle?
+  /// #3546: the one owner of Parakeet selection policy. It runs the delivery
+  /// stage (the delivery handle and the request the manager reads now live
+  /// there, with their reasons) and hands back a prepared load.
+  private let parakeetUpgrade: ParakeetUpgradeCoordinator
   /// #1707 Phase 2: DEBUG fault-injection oracle (§11.1) — `nil` in every
   /// production/test path that doesn't explicitly construct one.
   private let batchDecodeFaultController: BatchDecodeFaultController?
@@ -204,7 +205,7 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
       operation: { [weak self] in
         guard let self else { return false }
         do {
-          try await self.warmUp()
+          try await self.warmUp(modelReceipt: nil)
           return true
         } catch {
           return false
@@ -233,14 +234,14 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
   // MARK: Init
 
   init(
-    asrManager: any ASRManagerInterface, delivery: ParakeetDeliveryHandle? = nil,
+    asrManager: any ASRManagerInterface, parakeetUpgrade: ParakeetUpgradeCoordinator,
     asrInterruptionRecoveryDeadlineSec: Double = 8.0,
     // #1707 Phase 2: DEBUG fault-injection oracle (§11.1). Defaulted `nil`
     // so every existing test construction site is unaffected.
     batchDecodeFaultController: BatchDecodeFaultController? = nil
   ) {
     self.asrManager = asrManager
-    self.delivery = delivery
+    self.parakeetUpgrade = parakeetUpgrade
     self.asrInterruptionRecoveryDeadlineSec = asrInterruptionRecoveryDeadlineSec
     self.batchDecodeFaultController = batchDecodeFaultController
     (loadStream, loadContinuation) = AsyncStream.makeStream(of: ASRLoadProgressTick.self)
@@ -293,13 +294,55 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
     return isLoadInFlight ? .warming : .notReady
   }
 
+  // MARK: ASREngineAdapter — model attribution (#3546 §3.7 T1)
+
+  var servingModelIdentity: ASRModelIdentity? {
+    asrManager.isModelLoaded ? asrManager.publishedModelIdentity : nil
+  }
+
+  func requestedModelIdentity() -> ASRModelIdentity? {
+    parakeetUpgrade.requestedModelIdentity
+  }
+
+  func inferenceEntry(for session: SessionID) -> ASRInferenceEntry? {
+    inferenceReceipts.entry(for: session)
+  }
+
+  var onInferenceEntryRecorded: (@MainActor (SessionID) -> Void)?
+
+  /// One receipt per recent session (`InferenceReceiptBook`): every operation of a session
+  /// records into that session's own receipt, so a late operation can never mark a newer
+  /// session.
+  private let inferenceReceipts = InferenceReceiptBook()
+
+  /// The request one warm-up's physical loads named, written synchronously right
+  /// before each load inside that warm-up.
+  private final class AttemptedModel {
+    var identity: ASRModelIdentity?
+  }
+
+  /// The inference observation for one vendor call (or, for streaming, every window of
+  /// one stream), bound to `session`'s own receipt and the model serving now. Passed WITH
+  /// the call; the vendor boundary calls it synchronously only if the call is made. Never
+  /// built for a fault-injected failure, which skips the vendor.
+  private func inferenceObserver(for session: SessionID?) -> ASRInferenceEntryObserver? {
+    inferenceReceipts.observer(session: session, identity: servingModelIdentity) {
+      [weak self] session in self?.onInferenceEntryRecorded?(session)
+    }
+  }
+
   // MARK: ASREngineAdapter — warm-up
 
   /// Idempotent, sessionless warm-up. Wires `loadProgressTickReporter` for the
   /// duration of the `loadModel()` call so the kernel's signal-based load-wedge
   /// detection (D5) sees progress ticks; clears it after the load resolves.
-  func warmUp() async throws {
-    if asrManager.isModelLoaded { return }
+  func warmUp(modelReceipt: WarmUpModelReceipt?) async throws {
+    if asrManager.isModelLoaded {
+      modelReceipt?.attribution = servingModelIdentity.map {
+        ASRModelAttribution(identity: $0, loaded: true, inferenceReached: false)
+      }
+      return
+    }
     // #1707 Codex code-diff r1: `warmUp()` was only ever called once per
     // session before `recoverFromASRInterruption()` started calling it a
     // second time mid-session. A timed-out, abandoned call's `defer` can
@@ -352,77 +395,12 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
       }
     }
 
-    // #1348 Phase 2: delivery stage BEFORE any load. The host admits a
-    // verified cache (fetch/validate/repair as needed); the service then
-    // loads cache-only and can never download. Flag off (or no handle) =
-    // legacy path, bit-for-bit.
-    let deliveryActive: Bool
-    // #2697: ONE awaited door, taken before the branch rather than inside it.
-    // Migration used to live inside `ensureAvailable()`, so the kill-switch
-    // branch below never got it. Whatever the flag says, the location is made
-    // ready first, and a REFUSAL arrives as `nil` rather than as a path that
-    // looks fine.
-    // Review B4: a missing HANDLE is not a refusal and must not be treated as
-    // one. It means the bundled manifest failed to load, so there is no
-    // registration and nothing has judged anything — while the user may still
-    // have a perfectly good model in our own directory. Assigning `nil` there
-    // made an existing installation unloadable to fix a problem it does not
-    // have. A handle that EXISTS and returns `nil` has genuinely refused, and
-    // that still travels to `loadModel()` as a refusal.
-    var locationRefused = false
-    if let delivery {
-      let ready = await delivery.ensureModelLocationReady()
-      locationRefused = ready == nil
-      asrManager.parakeetModelDirectory = ready
-    } else {
-      asrManager.parakeetModelDirectory =
-        ParakeetInstallLocation.directoryFromSystemApplicationSupport()
-    }
-    // Cloud review P1: A REFUSAL STOPS THE ATTEMPT, not just the load.
-    //
-    // `nil` from the seam means the location was judged unusable — it resolves
-    // into the donor, or storage is unavailable. Letting `ensureAvailable()` run
-    // anyway sends an attempt at that location, and an attempt DELETES failed
-    // components and promotes into it. Refusing at `loadModel()` alone is a
-    // refusal that arrives after the writes it was supposed to prevent.
-    //
-    // This is the same defect the reviewer found at Settings Resume one round
-    // earlier. I fixed that door and left this one, which is the MAIN path —
-    // so the fix is stated here as a rule rather than a patch: every caller that
-    // acts on the location must check the refusal, and there are now three.
-    if locationRefused {
-      throw ParakeetDeliveryError(
-        DeliveryFailure(reason: .cacheRepairFailed, detail: "location_refused"))
-    }
-    if let delivery, delivery.isEnabled() {
-      deliveryActive = true
-      asrManager.parakeetCacheOnly = true
-      switch await delivery.ensureAvailable() {
-      case .admitted:
-        break
-      case .failed(let failure):
-        throw ParakeetDeliveryError(failure)
-      case .cancelled:
-        throw CancellationError()
-      }
-    } else {
-      deliveryActive = false
-      asrManager.parakeetCacheOnly = false
-      // #2483: the legacy branch uses our directory TOO, and this is the half
-      // that closes the vendor's own deletion. With `cacheOnly` false,
-      // FluidAudio's offline switch is off, so `ModelHub.loadModels` may purge
-      // the whole repo directory after a failed load and may write a vocabulary
-      // file into it. Both are acceptable inside a directory we own and were
-      // never acceptable inside FluidAudio's shared one.
-      //
-      // #2697: the directory is assigned above, before this branch, and it has
-      // already been migrated. This branch used to resolve its own fallback,
-      // which is why a user on the kill switch re-downloaded a model they
-      // already had — and, offline, could not warm up at all.
-      delivery?.noteLegacyPathActive()
-    }
+    // #3546: the delivery stage (location, admission, the request the manager
+    // reads) moved, with its reasons, into `ParakeetUpgradeCoordinator`.
+    let prepared = try await parakeetUpgrade.prepareLoad()
 
-    // #1707 Codex code-diff r9/r10: `delivery.ensureAvailable()` above is a
+    // #1707 Codex code-diff r9/r10: `delivery.ensureAvailable()` above (inside
+    // `prepareLoad()` since #3546) is a
     // long, separately-owned await (cache fetch/validate/repair, epic #1348)
     // whose own internal cancellation responsiveness this call has no
     // visibility into. If a timeout's `operationTask.cancel()` fires while
@@ -444,40 +422,56 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
     try Task.checkCancellation()
     guard warmUpGeneration == myWarmUpGeneration else { throw CancellationError() }
 
+    // #3546: the load and its failure plan (repair, or a fallback identity at
+    // the initial load) run in the upgrade coordinator's one sequence, shared
+    // with `ActiveEngineOperation`. The plan excludes cancellation,
+    // supersession and budget refusals itself. With no target, `repairable` is
+    // true exactly when delivery is active (the old local `deliveryActive`),
+    // read from THIS warm-up's request.
+    // #1388 (Codex r3 P1): a user Cancel must NOT fall into the repair
+    // retry — repairing an intact cache succeeds and silently restarts the
+    // install the user just cancelled (the founder watched exactly this
+    // ~2s resurrection live). Same policy as the transport-recovery catch:
+    // cancellation propagates untouched.
+    // One-shot load-miss repair (#1348 grounded r1 revision 7): a
+    // cache-only load failure (raced deletion, missed corruption) gets ONE
+    // revalidate/repair pass and ONE retry; a second failure is terminal.
+    // Owner is THIS warm-up sequence (a local, not stored state) — callers
+    // cannot duplicate it because warm-up is single-flighted upstream.
+    // Composed AROUND the transport recovery (exhaustive r7 finding 6) so
+    // a stale-helper retry that then misses the cache still gets its
+    // repair pass. (#3546: the handle check and the repair call moved into
+    // `repairAfterLoadFailure`, with their reason, behind `handleLoadFailure`.)
+    // #3546 §3.7 T1: the request each physical load of THIS warm-up names, read
+    // synchronously right before that load (the coordinator froze it just now).
+    let attempted = AttemptedModel()
     do {
-      try await asrManager.loadModel()
-    } catch let error
-      where deliveryActive
-      && !(error is ASRLoadSupersededError)
-      // #1388 (Codex r3 P1): a user Cancel must NOT fall into the repair
-      // retry — repairing an intact cache succeeds and silently restarts the
-      // install the user just cancelled (the founder watched exactly this
-      // ~2s resurrection live). Same policy as the transport-recovery catch:
-      // cancellation propagates untouched.
-      && !(error is ASRLoadCancelledError)
-      && !(error is CancellationError)
-    {
-      // One-shot load-miss repair (#1348 grounded r1 revision 7): a
-      // cache-only load failure (raced deletion, missed corruption) gets ONE
-      // revalidate/repair pass and ONE retry; a second failure is terminal.
-      // Owner is THIS warm-up sequence (a local, not stored state) — callers
-      // cannot duplicate it because warm-up is single-flighted upstream.
-      // Composed AROUND the transport recovery (exhaustive r7 finding 6) so
-      // a stale-helper retry that then misses the cache still gets its
-      // repair pass. deliveryActive guarantees the handle exists; a nil here
-      // would be a logic error, so fail the warm-up rather than crash.
-      guard let delivery, case .admitted = await delivery.repair() else { throw error }
-      // Same staleness window as the guard above, at `delivery.repair()`'s
-      // own long, separately-owned await instead of `ensureAvailable()`'s —
-      // same two-signal reasoning (r10): cancellation first, then generation.
-      try Task.checkCancellation()
-      guard warmUpGeneration == myWarmUpGeneration else { throw CancellationError() }
-      try await asrManager.loadModel()
+      try await parakeetUpgrade.loadPrepared(
+        prepared,
+        checkCaller: {
+          // Same staleness window as the guard above, at `delivery.repair()`'s
+          // own long, separately-owned await instead of `ensureAvailable()`'s —
+          // same two-signal reasoning (r10): cancellation first, then generation.
+          try Task.checkCancellation()
+          guard self.warmUpGeneration == myWarmUpGeneration else { throw CancellationError() }
+        },
+        load: {
+          attempted.identity = self.parakeetUpgrade.requestedModelIdentity
+          try await self.asrManager.loadModel()
+        })
+    } catch {
+      modelReceipt?.attribution = attempted.identity.map {
+        ASRModelAttribution(identity: $0, loaded: false, inferenceReached: false)
+      }
+      throw error
     }
     // #959: a superseded load throws from `loadModel()`, but recheck readiness
     // anyway so any "returned but not actually loaded" path reports failure to
     // `ensureEngineWarm()` instead of a false "warm-up succeeded".
     guard asrManager.isModelLoaded else { throw ASRLoadSupersededError() }
+    modelReceipt?.attribution = servingModelIdentity.map {
+      ASRModelAttribution(identity: $0, loaded: true, inferenceReached: false)
+    }
   }
 
   /// Latest phase string observed by the in-flight `loadProgressTickReporter`,
@@ -532,6 +526,7 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
     recoveryGeneration &+= 1
     retryGeneration &+= 1  // #1707 Phase 2: also invalidate any pending retry.
     sessionID = id
+    inferenceReceipts.open(id)  // #3546: before any suspension, so every operation finds it
     decodeOptions = options
     isTerminal = false
     isCancelled = false
@@ -582,11 +577,16 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
       // cleanup call actually reaching `ASRManager`. `onTimeout` runs
       // synchronously to completion first — matches `recoverFromASRInterruption()`'s
       // own use of this primitive for the exact same reason on the load side.
+      // #3546: bound to THIS session's receipt before the deadline operation is
+      // scheduled, and passed through every helper, so a late or abandoned start can
+      // only ever record for this session.
+      let windowObserver = inferenceObserver(for: id)
       let outcome = await withMainActorOrderedDeadline(
         seconds: asrInterruptionRecoveryDeadlineSec,
         operation: { [weak self, options] () -> StreamingStartOutcome in
           guard let self else { return .cancelled }
-          return await self.attemptStreamingStart(options: options, attemptID: attemptID)
+          return await self.attemptStreamingStart(
+            options: options, attemptID: attemptID, onWindowInferenceEntered: windowObserver)
         },
         onTimeout: { [weak self] in
           self?.asrManager.cancelInFlightStreamingStart(attemptID: attemptID)
@@ -697,7 +697,8 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
   /// cannot compile; an `await self.method()` call can, the same way
   /// `recoverFromASRInterruption`'s own deadline closure calls `self.warmUp()`.
   private func attemptStreamingStart(
-    options: TranscriptionOptions, attemptID: UUID
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver?
   ) async -> StreamingStartOutcome {
     // #1908 round 11: re-check before ever entering the manager — this
     // closure can be scheduled after this attempt was already abandoned.
@@ -705,7 +706,9 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
       return .cancelled
     }
     do {
-      try await asrManager.startStreaming(options: options, attemptID: attemptID)
+      try await asrManager.startStreaming(
+        options: options, attemptID: attemptID,
+        onWindowInferenceEntered: onWindowInferenceEntered)
       return .succeeded
     } catch is CancellationError {
       return .cancelled
@@ -928,7 +931,7 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
   /// the delivery — a cancelled recording must not kill a first-run download
   /// running in the background.
   func cancelSessionlessWarmup() async {
-    await delivery?.cancelActiveFetch()
+    await parakeetUpgrade.cancelActiveFetch()
     await cancel()
   }
 
@@ -964,7 +967,7 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
     let generation = retryGeneration
     if readiness != .ready {
       do {
-        try await warmUp()
+        try await warmUp(modelReceipt: nil)
       } catch {
         // Codex r6: without this, `lastFailureError` still holds the STALE
         // error from the PRIMARY decode's own earlier failure (set by
@@ -1171,7 +1174,8 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
     }
     do {
       let result = try await asrManager.transcribe(
-        audioSamples: samples, options: decodeOptions)
+        audioSamples: samples, options: decodeOptions,
+        onInferenceEntered: inferenceObserver(for: session))
       let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
       diagnostics.batchRescueResultChars = trimmed.count
       await AppLogger.shared.log(
@@ -1247,7 +1251,8 @@ final class ParakeetEngineAdapter: ASREngineAdapter, @unchecked Sendable {
     }
     do {
       let result = try await asrManager.transcribe(
-        audioSamples: samples, options: decodeOptions)
+        audioSamples: samples, options: decodeOptions,
+        onInferenceEntered: inferenceObserver(for: sessionID))
       let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
       diagnostics.batchRescueResultChars = trimmed.count
       if trimmed.isEmpty {

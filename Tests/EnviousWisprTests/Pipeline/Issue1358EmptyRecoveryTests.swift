@@ -244,7 +244,8 @@ struct Issue1358EmptyRecoveryTests {
     return KernelFinalizationWiring(
       outcome: outcome,
       context: context,
-      adapter: ParakeetEngineAdapter(asrManager: StubParakeetASRManager()),
+      adapter: ParakeetEngineAdapter(
+      asrManager: StubParakeetASRManager(), parakeetUpgrade: .legacyForTesting()),
       steps: steps ?? makeSteps(),
       textProcessingRunner: TextProcessingRunner(
         timeoutExecutor: FakeTimeoutExecutor(throwBelowSeconds: 0).run),

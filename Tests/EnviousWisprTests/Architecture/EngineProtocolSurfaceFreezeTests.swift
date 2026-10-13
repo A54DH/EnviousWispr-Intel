@@ -21,7 +21,7 @@ import Testing
 // protocols and TWO known concrete-only method surfaces not declared by any
 // of the ten protocols (one, `WhisperKitEngineAdapter.unloadForRemoval()`,
 // is reached only via a type-cast; the other,
-// `ParakeetBackend.prepare(cacheOnly:progressCallback:)`, is reached via a
+// `ParakeetBackend.prepare(selection:progressCallback:)`, is reached via a
 // type-cast at one call site AND via direct, uncast construction/ownership
 // at another — `ASRServiceHandler.swift` builds and holds a concrete
 // `ParakeetBackend` natively), all grounded as of 2026-07-23. It
@@ -421,10 +421,11 @@ import Testing
           condition: nil,
           signature: "func prepare(progressCallback: ProgressCallback?) async throws"
         ),
+        // #3546 §3.7 T1: the per-call inference observation, committed at the vendor boundary.
         MemberSignature(
           condition: nil,
           signature:
-            "func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult"
+            "func transcribe(\n    audioSamples: [Float], options: TranscriptionOptions,\n    onInferenceEntered: ASRInferenceEntryObserver?\n  ) async throws -> ASRResult"
         ),
         MemberSignature(condition: nil, signature: "func unload() async"),
         MemberSignature(condition: nil, signature: "var supportsStreaming: Bool { get }"),
@@ -435,7 +436,9 @@ import Testing
         // #2918: a requirement for the same reason, so the file import's observer reaches the backend.
         MemberSignature(
           condition: nil,
-          signature: "func setTranscriptionProgressObserver(_ observer: (@Sendable (Double) -> Void)?) async"),
+          signature:
+            "func setTranscriptionProgressObserver(_ observer: (@Sendable (Double) -> Void)?) async"
+        ),
         MemberSignature(
           condition: nil,
           signature: "func startStreaming(options: TranscriptionOptions) async throws"
@@ -451,10 +454,13 @@ import Testing
         // #2787: observation-only chunk reports; default is no signal.
         MemberSignature(
           condition: nil,
-          signature: "public func setDecodeChunkObserver(_ observer: (@Sendable () -> Void)?) async"),
+          signature: "public func setDecodeChunkObserver(_ observer: (@Sendable () -> Void)?) async"
+        ),
         MemberSignature(
           condition: nil,
-          signature: "public func setTranscriptionProgressObserver(_ observer: (@Sendable (Double) -> Void)?) async"),
+          signature:
+            "public func setTranscriptionProgressObserver(_ observer: (@Sendable (Double) -> Void)?) async"
+        ),
         MemberSignature(
           condition: nil,
           signature: "public func startStreaming(options _: TranscriptionOptions) async throws"),
@@ -475,13 +481,15 @@ import Testing
       members: [
         MemberSignature(condition: nil, signature: "var activeBackendType: ASRBackendType { get }"),
         MemberSignature(condition: nil, signature: "var isModelLoaded: Bool { get }"),
+        // #3546 §3.7 T1: read-only telemetry query; not engine-mutating.
+        MemberSignature(
+          condition: nil, signature: "var publishedModelIdentity: ASRModelIdentity? { get }"),
         MemberSignature(condition: nil, signature: "var isStreaming: Bool { get }"),
         MemberSignature(condition: nil, signature: "var downloadProgress: Double { get }"),
         MemberSignature(condition: nil, signature: "var downloadPhase: String { get }"),
         MemberSignature(condition: nil, signature: "var downloadDetail: String { get }"),
-        MemberSignature(condition: nil, signature: "var parakeetCacheOnly: Bool { get set }"),
-        MemberSignature(
-          condition: nil, signature: "var parakeetModelDirectory: URL? { get set }"),
+        // #3546: `parakeetCacheOnly` and `parakeetModelDirectory` removed; the
+        // Parakeet load request is a package `ParakeetModelSelection`.
         MemberSignature(condition: nil, signature: "func loadModel() async throws"),
         MemberSignature(condition: nil, signature: "func unloadModel() async"),
         MemberSignature(
@@ -490,30 +498,35 @@ import Testing
           condition: nil, signature: "func switchBackend(to type: ASRBackendType) async"),
         MemberSignature(
           condition: nil, signature: "var activeBackendSupportsStreaming: Bool { get async }"),
-        MemberSignature(
-          condition: nil,
-          signature:
-            "func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult"
-        ),
         // #2787: the engine-busy authority a record press, replay and unload consult.
         MemberSignature(
           condition: nil, signature: "var vendorDecodeOccupancy: VendorDecodeOccupancy { get }"),
         // #2787: observation-only chunk reports from the active backend.
         MemberSignature(
           condition: nil,
-          signature: "var onVendorDecodeChunkScheduled: (@MainActor @Sendable () -> Void)? { get set }"),
+          signature:
+            "var onVendorDecodeChunkScheduled: (@MainActor @Sendable () -> Void)? { get set }"),
         // #2918: observation-only transcription progress (a 0...1 fraction) for the file import.
         MemberSignature(
           condition: nil,
-          signature: "var onTranscriptionProgress: (@MainActor @Sendable (Double) -> Void)? { get set }"),
+          signature:
+            "var onTranscriptionProgress: (@MainActor @Sendable (Double) -> Void)? { get set }"),
+        // #3546 §3.7 T1: `transcribe` and `startStreaming` carry the per-call inference
+        // observation; engine-mutating by name, already in the inventory vocabulary.
         MemberSignature(
           condition: nil,
           signature:
-            "func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws"),
-        MemberSignature(
-          condition: nil, signature: "func feedAudio(_ buffer: AVAudioPCMBuffer) async throws"),
+            "func transcribe(\n    audioSamples: [Float], options: TranscriptionOptions,\n    onInferenceEntered: ASRInferenceEntryObserver?\n  ) async throws -> ASRResult"
+        ),
         MemberSignature(
           condition: nil, signature: "func finalizeStreaming() async throws -> ASRResult"),
+        MemberSignature(
+          condition: nil,
+          signature:
+            "func startStreaming(\n    options: TranscriptionOptions, attemptID: UUID,\n    onWindowInferenceEntered: ASRInferenceEntryObserver?\n  ) async throws"
+        ),
+        MemberSignature(
+          condition: nil, signature: "func feedAudio(_ buffer: AVAudioPCMBuffer) async throws"),
         MemberSignature(condition: nil, signature: "func cancelStreaming() async"),
         MemberSignature(
           condition: nil, signature: "func noteTranscriptionComplete(policy: ModelUnloadPolicy)"),
@@ -552,9 +565,10 @@ import Testing
         MemberSignature(
           condition: nil,
           signature: "public var feedsSharedProgressFile: Bool { false }"),
+        // #3546 §3.7 T1: test doubles publish no delivered model.
         MemberSignature(
           condition: nil,
-          signature: "public var parakeetCacheOnly: Bool {\n    get { false }\n    set {}\n  }"),
+          signature: "public var publishedModelIdentity: ASRModelIdentity? { nil }"),
         MemberSignature(
           condition: nil,
           signature: "public func attemptWedgeRecoveryUnload() async"),
@@ -581,8 +595,20 @@ import Testing
         MemberSignature(
           condition: nil, signature: "var capabilities: ASREngineCapabilities { get }"),
         MemberSignature(condition: nil, signature: "var readiness: ASREngineReadiness { get }"),
+        // #3546 §3.7 T1: read-only model attribution queries; not engine-mutating.
+        MemberSignature(
+          condition: nil, signature: "var servingModelIdentity: ASRModelIdentity? { get }"),
+        MemberSignature(
+          condition: nil, signature: "func requestedModelIdentity() -> ASRModelIdentity?"),
+        MemberSignature(
+          condition: nil,
+          signature: "func inferenceEntry(for session: SessionID) -> ASRInferenceEntry?"),
+        MemberSignature(
+          condition: nil,
+          signature: "var onInferenceEntryRecorded: (@MainActor (SessionID) -> Void)? { get set }"),
         MemberSignature(condition: nil, signature: "var lastWarmupInferenceMs: Int? { get }"),
-        MemberSignature(condition: nil, signature: "func warmUp() async throws"),
+        MemberSignature(
+          condition: nil, signature: "func warmUp(modelReceipt: WarmUpModelReceipt?) async throws"),
         MemberSignature(
           condition: nil, signature: "var loadProgress: AsyncStream<ASRLoadProgressTick>? { get }"),
         MemberSignature(condition: nil, signature: "var lastObservedPhase: String { get }"),
@@ -665,10 +691,11 @@ import Testing
         MemberSignature(condition: nil, signature: "var modelVariantName: String { get }"),
         MemberSignature(condition: nil, signature: "var lastWarmupInferenceMs: Int? { get }"),
         MemberSignature(condition: nil, signature: "func prepare() async throws"),
+        // #3546 §3.7 T1: the observation travels with the call.
         MemberSignature(
           condition: nil,
           signature:
-            "func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult"
+            "func transcribe(\n    audioSamples: [Float], options: TranscriptionOptions,\n    onInferenceEntered: ASRInferenceEntryObserver?\n  ) async throws -> ASRResult"
         ),
         MemberSignature(
           condition: nil,
@@ -678,7 +705,7 @@ import Testing
         MemberSignature(
           condition: nil,
           signature:
-            "func makeStreamingSession(\n    options: TranscriptionOptions, vendorDecodeOccupancy: VendorDecodeOccupancy\n  ) async -> (any WhisperKitIncrementalSession)?"
+            "func makeStreamingSession(\n    options: TranscriptionOptions, vendorDecodeOccupancy: VendorDecodeOccupancy,\n    onDecode: ASRInferenceEntryObserver?\n  ) async -> (any WhisperKitIncrementalSession)?"
         ),
         MemberSignature(condition: nil, signature: "func unload() async"),
       ]),
@@ -739,7 +766,7 @@ import Testing
         MemberSignature(
           condition: nil,
           signature:
-            "public func prepare(\n    cacheOnly: Bool, modelDirectory: URL, progressCallback: ProgressCallback?\n  ) async throws"
+            "package func prepare(\n    selection: ParakeetModelSelection, progressCallback: ProgressCallback?\n  ) async throws"
         ),
       ]),
   ]

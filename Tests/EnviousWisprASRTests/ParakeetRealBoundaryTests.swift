@@ -36,6 +36,15 @@ enum ParakeetRealBoundaryFixture {
     return AsrModels.modelsExist(at: installDirectory, version: .v3)
   }
 
+  /// #3546: Parakeet Ultra, the shipped model, in the directory the app installs it into.
+  static var ultraInstallDirectory: URL {
+    ParakeetInstallLocation.directory(for: .ultra, dataDirectory: StorageRoot.live.dataDirectory)
+  }
+
+  static var ultraIsInstalled: Bool {
+    AsrModels.modelsExist(at: ultraInstallDirectory, version: .ultra)
+  }
+
   static func normalizedWords(_ text: String) -> String {
     text.lowercased()
       .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
@@ -66,7 +75,9 @@ struct ParakeetRealBoundaryTests {
       let backend = ParakeetBackend()
       do {
         try await backend.prepare(
-          cacheOnly: true, modelDirectory: ParakeetRealBoundaryFixture.installDirectory,
+          selection: ParakeetModelSelection(
+            model: .v3, revision: nil, directory: ParakeetRealBoundaryFixture.installDirectory, cacheOnly: true,
+            displayBytes: ParakeetModel.v3ShippedBytes, repairable: false, generation: 1),
           progressCallback: nil)
         let result = try await backend.transcribe(audioSamples: samples, options: .default)
         await backend.unload()
@@ -83,5 +94,70 @@ struct ParakeetRealBoundaryTests {
         == ParakeetRealBoundaryFixture.expectedTranscript,
       "Parakeet returned: \(result.text)"
     )
+  }
+
+  /// #3546: the same receipt on Parakeet Ultra.
+  @Test(
+    "the shipped Ultra model transcribes committed speech",
+    .enabled(if: ParakeetRealBoundaryFixture.ultraIsInstalled),
+    .tags(.realBoundary)
+  )
+  func ultraTranscribesCommittedSpeech() async throws {
+    let samples = try AudioConverter().resampleAudioFile(
+      path: ParakeetRealBoundaryFixture.audioURL.path)
+    let result: EnviousWisprCore.ASRResult = try await withParakeetOfflineModeExclusion {
+      let backend = ParakeetBackend()
+      do {
+        try await backend.prepare(
+          selection: ParakeetModelSelection(
+            model: .ultra, revision: nil,
+            directory: ParakeetRealBoundaryFixture.ultraInstallDirectory, cacheOnly: true,
+            displayBytes: ParakeetModel.v3ShippedBytes, repairable: false, generation: 1),
+          progressCallback: nil)
+        let result = try await backend.transcribe(audioSamples: samples, options: .default)
+        await backend.unload()
+        return result
+      } catch {
+        await backend.unload()
+        throw error
+      }
+    }
+    #expect(
+      ParakeetRealBoundaryFixture.normalizedWords(result.text)
+        == ParakeetRealBoundaryFixture.expectedTranscript,
+      "Parakeet Ultra returned: \(result.text)")
+  }
+
+  /// #3546: the manager's load hooks fire once per PHYSICAL load, on the real
+  /// shipped model. Two loads asked for together join one physical load, so
+  /// the upgrade policy counts one attempt and hears one success, carrying the
+  /// request that load read.
+  @Test(
+    "a joined load counts one physical load and reports one ready publish",
+    .enabled(if: ParakeetRealBoundaryFixture.shippedModelIsInstalled),
+    .tags(.realBoundary)
+  )
+  @MainActor
+  func joinedLoadFiresEachHookOnce() async throws {
+    try await withParakeetOfflineModeExclusion {
+      let selection = ParakeetSelectionProvider()
+      var before: [ParakeetModelSelection] = []
+      var published: [ParakeetModelSelection] = []
+      selection.beforePhysicalLoad = { before.append($0) }
+      selection.didPublishLoad = { published.append($0) }
+      let request = selection.select(
+        model: .v3, revision: nil, directory: ParakeetRealBoundaryFixture.installDirectory,
+        cacheOnly: true, displayBytes: ParakeetModel.v3ShippedBytes, repairable: false)
+      let manager = ASRManager(
+        engineMutationScope: .alwaysAllowedForTesting, parakeetSelection: selection)
+      manager.setInitialBackendType(.parakeet)
+      async let first: Void = manager.loadModel()
+      async let second: Void = manager.loadModel()
+      _ = try await (first, second)
+      #expect(manager.isModelLoaded)
+      #expect(before == [request])
+      #expect(published == [request])
+      await manager.unloadModel()
+    }
   }
 }

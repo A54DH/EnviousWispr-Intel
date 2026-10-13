@@ -39,6 +39,7 @@ struct DedupSurvivesStallTests {
       inputs: .init(
         audioCapture: audioCapture,
         asrManager: asrManager,
+        parakeetUpgrade: .legacyForTesting(),
         vadSignalSource: vad,
         transcriptStore: TranscriptStore(),
         keychainManager: KeychainManager(),
@@ -223,11 +224,6 @@ private final class NeverFinishingAudioCapture: AudioCaptureInterface {
 /// methods throw / return trivial values to flag unintended invocation.
 @MainActor
 private final class NoOpASRManagerV2: ASRManagerInterface {
-  /// #2697: real storage, because the protocol no longer carries a default.
-  /// The default answered an assumed install directory, so a double that never
-  /// set one still reported a usable path. `nil` means nobody has said where the
-  /// model is, which is what a double that loads nothing should say.
-  var parakeetModelDirectory: URL?
   var activeBackendType: ASRBackendType = .parakeet
   var isModelLoaded: Bool = false
   let vendorDecodeOccupancy = VendorDecodeOccupancy()
@@ -255,10 +251,16 @@ private final class NoOpASRManagerV2: ASRManagerInterface {
   func setInitialBackendType(_ type: ASRBackendType) { activeBackendType = type }
   func switchBackend(to type: ASRBackendType) async { activeBackendType = type }
   var activeBackendSupportsStreaming: Bool { get async { false } }
-  func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult {
+  func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws -> ASRResult {
     throw V2StubError.unexpected
   }
-  func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws {
+  func startStreaming(
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws {
     throw V2StubError.unexpected
   }
   func feedAudio(_ buffer: AVAudioPCMBuffer) async throws { throw V2StubError.unexpected }

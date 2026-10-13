@@ -62,9 +62,19 @@ final class BenchmarkSuite {
   /// unchanged.
   private let engineLease: EngineLease
 
-  init(engineMutationScope: EngineMutationScope, engineLease: EngineLease = EngineLease()) {
+  /// #3546 A3: whether an engine switch or the in-session Parakeet Ultra activation is in
+  /// flight. Neither holds the lease, so without this a speed test started mid-switch would
+  /// load and decode on the engine being replaced. Required, so a new construction site
+  /// cannot silently skip it.
+  private let isEngineSwitching: @MainActor () -> Bool
+
+  init(
+    engineMutationScope: EngineMutationScope, engineLease: EngineLease = EngineLease(),
+    isEngineSwitching: @escaping @MainActor () -> Bool
+  ) {
     self.engineLease = engineLease
     self.engineMutationScope = engineMutationScope
+    self.isEngineSwitching = isEngineSwitching
   }
 
   /// Ensure model is loaded, returning false (and updating progress) if loading fails.
@@ -96,6 +106,13 @@ final class BenchmarkSuite {
   /// measured against a machine busy doing something else, which is worse than
   /// no number.
   private func withEngineClaim(_ body: () async -> Void) async {
+    // Checked in the same MainActor turn as the claim below, so a switch cannot start between.
+    guard !isEngineSwitching() else {
+      lastFailure = String(
+        localized: "The engine is busy. Try again in a moment.",
+        comment: "Settings > Diagnostics, speed test: refused because the speech engine is in use.")
+      return
+    }
     let token: EngineLease.Token
     switch engineLease.admit(.dictation) {
     case .granted(let granted):
@@ -146,7 +163,7 @@ final class BenchmarkSuite {
         let samples = generateTestAudio(duration: duration)
 
         let start = CFAbsoluteTimeGetCurrent()
-        _ = try? await activeEngine.transcribe(samples, .default)
+        _ = try? await activeEngine.transcribe(samples, .default, nil)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
 
         results.append(
@@ -238,7 +255,7 @@ final class BenchmarkSuite {
         localized: "Running batch ASR...",
         comment: "Settings > Diagnostics, speed test: progress. ASR means speech recognition.")
       let batchStart = CFAbsoluteTimeGetCurrent()
-      let batchResult = try? await activeEngine.transcribe(testSamples, .default)
+      let batchResult = try? await activeEngine.transcribe(testSamples, .default, nil)
       batchTime = CFAbsoluteTimeGetCurrent() - batchStart
       batchTranscript = batchResult?.text ?? ""
       // This closure's own return below is what releases row 23's claim
@@ -280,7 +297,8 @@ final class BenchmarkSuite {
       let streamingOutcome = await engineMutationScope.withClaim(site: "benchmarkSuiteStreaming") {
         var startedStreaming = false
         do {
-          try await asrManager.startStreaming(options: .default, attemptID: UUID())
+          try await asrManager.startStreaming(
+            options: .default, attemptID: UUID(), onWindowInferenceEntered: nil)
           startedStreaming = true
 
           // Chunk the samples into AVAudioPCMBuffers and feed them

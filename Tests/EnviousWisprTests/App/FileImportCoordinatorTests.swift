@@ -101,17 +101,17 @@ struct FileImportCoordinatorTests {
         polishIsCloud: false, localPolishProvider: nil, polishProvider: .egOne,
         ollamaModel: nil, polishModel: "eg-1", backendType: .parakeet)
     },
+    engineSelectionSettled: @escaping @MainActor () -> Bool = { true },
     ensureEngineReady: @escaping @MainActor () async -> FileImportCoordinator.EngineReadiness = {
       .ready
     },
-    engineIsLoaded: @escaping @MainActor () async -> Bool = { true },
     onEngineReleased: @escaping @MainActor () -> Void = {}
   ) -> FileImportCoordinator {
     FileImportCoordinator(
       decode: decode,
       // The rows above pass a plain text closure; the language rides alongside
       // it so a row that does not care about language never mentions one.
-      transcribe: { samples, onProgress in
+      transcribe: { samples, onProgress, _ in
         let text: String
         if let transcribeWithProgress {
           text = try await transcribeWithProgress(samples, onProgress)
@@ -123,7 +123,7 @@ struct FileImportCoordinatorTests {
           processingTime: 0, backendType: .parakeet)
       },
       engineAdmission: .live(lease: lease, as: .fileImport),
-      engineIsLoaded: engineIsLoaded,
+      engineSelectionSettled: engineSelectionSettled,
       ensureEngineReady: ensureEngineReady,
       onEngineReleased: onEngineReleased,
       beginRun: beginRun,
@@ -1336,14 +1336,15 @@ struct FileImportCoordinatorTests {
     processPart: @escaping @MainActor (String) async throws -> FileImportRunner.PartOutcome = {
       Self.outcome($0)
     },
-    engineIsLoaded: @escaping @MainActor () async -> Bool = { true },
+    engineSelectionSettled: @escaping @MainActor () -> Bool = { true },
     ensureEngineReady: @escaping @MainActor () async -> FileImportCoordinator.EngineReadiness = {
       .ready
     }
   ) async -> FileImportCoordinator {
     let coordinator = makeCoordinator(
       lease: lease, transcribe: transcribe, processPart: processPart,
-      ensureEngineReady: ensureEngineReady, engineIsLoaded: engineIsLoaded,
+      engineSelectionSettled: engineSelectionSettled,
+      ensureEngineReady: ensureEngineReady,
       onEngineReleased: { count.value += 1 })
     coordinator.choose(url: Self.anyURL)
     _ = await settleUntil {
@@ -1399,8 +1400,7 @@ struct FileImportCoordinatorTests {
     let readinessCalls = Counter()
     let coordinator = await readyCoordinator(
       lease: EngineLease(), count: count,
-      // Loaded at the first check, unloaded by the time the claim is taken, and not ready again.
-      engineIsLoaded: { false },
+      // Ready at the first check, and not ready again by the time the claim is taken.
       ensureEngineReady: {
         await readinessCalls.bump()
         return await readinessCalls.count == 1 ? .ready : .notReady
@@ -1409,6 +1409,56 @@ struct FileImportCoordinatorTests {
     _ = await settleUntil { count.value >= 1 }
     #expect(coordinator.state == .rejected(.engineNotReady))
     #expect(count.value == 1)
+  }
+
+  /// #3546 Chunk 12 whole-PR review r4: the user changed engines while the first readiness
+  /// drive loaded the old one. When this fails, the import waits under its claim for a switch
+  /// the engine owner defers until that claim is released: neither side finishes, and the
+  /// held engine blocks dictation.
+  @Test("an engine choice changed before the claim is refused, not awaited, under the claim")
+  func changedSelectionUnderClaimIsRefused() async {
+    let count = ReleaseCount()
+    let readinessCalls = Counter()
+    let coordinator = await readyCoordinator(
+      lease: EngineLease(), count: count,
+      engineSelectionSettled: { false },
+      ensureEngineReady: {
+        await readinessCalls.bump()
+        return .ready
+      })
+    coordinator.start()
+    _ = await settleUntil { count.value >= 1 }
+    #expect(coordinator.state == .rejected(.engineNotReady))
+    #expect(await readinessCalls.count == 1, "no readiness drive under the claim")
+    #expect(coordinator.isEngineHeld == false, "the claim is released")
+    #expect(count.value == 1)
+  }
+
+  /// #3546 Chunk 12 whole-PR review r6: the engine choice changes WHILE the readiness drive
+  /// under the claim waits (an in-session Ultra activation). When this fails, the import
+  /// freezes the new choice and transcribes on the old engine, or keeps waiting.
+  @Test("an engine choice changed during the claimed readiness drive is refused")
+  func selectionChangedDuringClaimedDriveIsRefused() async {
+    let count = ReleaseCount()
+    let readinessCalls = Counter()
+    var settledReads = 0
+    let coordinator = await readyCoordinator(
+      lease: EngineLease(), count: count,
+      // Settled before the drive, changed by the time it returns.
+      engineSelectionSettled: {
+        settledReads += 1
+        return settledReads == 1
+      },
+      ensureEngineReady: {
+        await readinessCalls.bump()
+        return .ready
+      })
+    coordinator.start()
+    _ = await settleUntil { count.value >= 1 }
+    #expect(coordinator.state == .rejected(.engineNotReady))
+    #expect(await readinessCalls.count == 2, "both drives ran; the second returned ready")
+    #expect(settledReads == 2)
+    #expect(coordinator.isEngineHeld == false, "the claim is released")
   }
 
   @Test("a run that fails after the claim fires the hook once")

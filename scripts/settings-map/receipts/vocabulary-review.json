@@ -11,8 +11,8 @@
  "retiredIDs": [],
  "resource": {
   "path": "Sources/EnviousWisprAppKit/Resources/SettingsSearchVocabulary.json",
-  "sha256": "73ad9dafda847a67cbe0801f3b0fe96f2bc646b0ae1571b4333102f0b89ef51d",
-  "bytes": 1600337
+  "sha256": "7f622292b158df2289a045554496e2c346a4e46ecb183356e21f8ede060e8d47",
+  "bytes": 1600313
  },
  "sources": [
   {
@@ -296,7 +296,7 @@
  "languages": [
   {
    "language": "ar",
-   "contentSHA256": "6e1b2ab4b9162abd728013c4add1254a1016e233f5aea042e1df52f088ea47ec",
+   "contentSHA256": "862f383110115ea95ab3b1ea401c3b92d9a171d849603e96ea209385912ff531",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -379,6 +379,15 @@
       "sha256": "5822ea18f01794271ab61c55ea12560bce6a99e9b487df703f658817b74d6a8b"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []
@@ -765,7 +774,7 @@
   },
   {
    "language": "el",
-   "contentSHA256": "839c06ddafb07839ffdf65bca90e44ba897c383144a84677264ed01691c66502",
+   "contentSHA256": "07e0f4f5cb55e2bbb0162541223db0ce0e21b31f04d4a43b7f1ddb33024bf3af",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -848,6 +857,15 @@
       "sha256": "897f2999f3b9c0808a071a6974ee6d83987ef69d52de2ddc4d7ec3d3c33d63bf"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []
@@ -958,7 +976,7 @@
   },
   {
    "language": "es",
-   "contentSHA256": "e7f4d18d18f5461219b8aa4fd72712fa6593572678de4b3aee2352d6f858e5cd",
+   "contentSHA256": "1fc0956ad86bc0cfe9afe74a2a8eddf6b1641cf6e81684d0c9af9ca2578efb30",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -1041,6 +1059,15 @@
       "sha256": "4a46af6e5ff98afcd62b831e5a169f6fd1992ff608d6228e18a9b6037c7b7bd1"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []
@@ -1581,7 +1608,7 @@
   },
   {
    "language": "it",
-   "contentSHA256": "3e92d607bff9409a75d3b2a1e7701163da16dd7657ee092795223d81e4b9b630",
+   "contentSHA256": "bfdd276b862e62301002031e1fcaad51ee32f4ea055cddfc8ed9c08219292bdc",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -1664,6 +1691,15 @@
       "sha256": "7e748d7f8d6140c82d3638ad1f3da1f5176adc23fca5cf293759c84b4b6d5705"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []
@@ -1848,7 +1884,7 @@
   },
   {
    "language": "lt",
-   "contentSHA256": "776182a6a1f47e0c33b4b5f4fd28e48fdea0251e4f37bd3d4a52ce218e8739d1",
+   "contentSHA256": "0581c33638863a856187fded7a9b8109f12d2e7d3acb1cb8a00adb6effaa2b58",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -1931,6 +1967,15 @@
       "sha256": "b5da3f8a4b112df851bf3975c2532cb9deb5ddb7216e8f828f34e1e3986a3e81"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []
@@ -2026,7 +2071,7 @@
   },
   {
    "language": "mt",
-   "contentSHA256": "20403143e9f149af002ecea1691a1ee24f8a760dd4832b3e76dbe2bc2ee07fb4",
+   "contentSHA256": "874e61a957b2fc8b783ecae085eddadcacd0eaeae6e1420c23802373a6cd9ee2",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -2109,6 +2154,15 @@
       "sha256": "d6f2172edbd2725c17f9fc7eed44ee9dcfc9c77ac41ef404bf8f96f52066c1af"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []
@@ -2657,7 +2711,7 @@
   },
   {
    "language": "sl",
-   "contentSHA256": "8265de4defd81fe893a5215b4c44ef0a8776f6f73fb69dc105bca841b276a839",
+   "contentSHA256": "167c7b0417fc79f66f3d264190b44aa4b690b47a76156bf2471700439f8056d6",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -2740,6 +2794,15 @@
       "sha256": "6eed9b93f31ac08d0582fb6d458b3e994ca78d36c238219b228898fd95e3bb77"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []
@@ -2924,7 +2987,7 @@
   },
   {
    "language": "uk",
-   "contentSHA256": "32d81f18f2b5d433210d7a573e88ed6d8bcd66d78addf9b522dd15370ebc946a",
+   "contentSHA256": "89393dee2ecc97a11f5f84393ba8e5f2f75b8707dfd4106d2d4d76817bdf1830",
    "reviews": [
     {
      "kind": "phase0-content",
@@ -3007,6 +3070,15 @@
       "sha256": "d1c304f45de5ae081a1b2f170fb899d5b720c553136e58c690761c464139a2da"
      },
      "disposition": "adopted as returned by the review (additions/keepOutOfClipboardHistory.json)"
+    },
+    {
+     "kind": "model-name-edit",
+     "scope": [
+      "currentEngineSection"
+     ],
+     "date": "2026-10-11",
+     "method": "#3546 chunk 8b orchestrator review (Codex, repo access), finding F5: the current-engine title names whichever Parakeet model serves, so the fixed version token is wrong once Ultra ships",
+     "disposition": "removed the version token \" v3\" from the reviewed title; no other word changed and no new translated content"
     }
    ],
    "phraseExemptions": []

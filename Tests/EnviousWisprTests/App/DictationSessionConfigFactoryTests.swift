@@ -283,11 +283,6 @@ private struct Harness {
 /// `activeBackendType`; everything else traps to make accidental use loud.
 @MainActor
 private final class FactoryFakeASRManager: ASRManagerInterface {
-  /// #2697: real storage, because the protocol no longer carries a default.
-  /// The default answered an assumed install directory, so a double that never
-  /// set one still reported a usable path. `nil` means nobody has said where the
-  /// model is, which is what a double that loads nothing should say.
-  var parakeetModelDirectory: URL?
   var activeBackendType: ASRBackendType
   init(backend: ASRBackendType) { self.activeBackendType = backend }
 
@@ -307,12 +302,18 @@ private final class FactoryFakeASRManager: ASRManagerInterface {
   func unloadModel() async { fatalError("not used in DictationSessionConfigFactoryTests") }
   func setInitialBackendType(_: ASRBackendType) { fatalError("not used") }
   func switchBackend(to _: ASRBackendType) async { fatalError("not used") }
-  func transcribe(audioSamples _: [Float], options _: TranscriptionOptions) async throws
+  func transcribe(
+    audioSamples _: [Float], options _: TranscriptionOptions,
+    onInferenceEntered _: ASRInferenceEntryObserver? = nil
+  ) async throws
     -> ASRResult
   {
     fatalError("not used")
   }
-  func startStreaming(options _: TranscriptionOptions, attemptID: UUID) async throws {
+  func startStreaming(
+    options _: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered _: ASRInferenceEntryObserver? = nil
+  ) async throws {
     fatalError("not used")
   }
   func feedAudio(_: AVAudioPCMBuffer) async throws { fatalError("not used") }

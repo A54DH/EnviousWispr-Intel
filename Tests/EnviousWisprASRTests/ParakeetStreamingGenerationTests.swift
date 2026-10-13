@@ -45,7 +45,10 @@ struct ParakeetStreamingGenerationTests {
       let backend = ParakeetBackend()
       do {
         try await backend.prepare(
-          cacheOnly: true, modelDirectory: ParakeetRealBoundaryFixture.installDirectory,
+          selection: ParakeetModelSelection(
+            model: .v3, revision: nil, directory: ParakeetRealBoundaryFixture.installDirectory,
+            cacheOnly: true,
+            displayBytes: ParakeetModel.v3ShippedBytes, repairable: false, generation: 1),
           progressCallback: nil)
 
         // Reserve two attempts, A then B, and hand STALE A to the internal entry directly — the
@@ -55,7 +58,8 @@ struct ParakeetStreamingGenerationTests {
         _ = backend.reserveStreamingGeneration()
 
         await #expect(throws: CancellationError.self) {
-          try await backend.startStreaming(options: .default, generation: staleGeneration)
+          try await backend.startStreaming(
+            options: .default, generation: staleGeneration, onWindowInferenceEntered: nil)
         }
 
         do {
@@ -90,7 +94,10 @@ struct ParakeetStreamingGenerationTests {
       let backend = ParakeetBackend()
       do {
         try await backend.prepare(
-          cacheOnly: true, modelDirectory: ParakeetRealBoundaryFixture.installDirectory,
+          selection: ParakeetModelSelection(
+            model: .v3, revision: nil, directory: ParakeetRealBoundaryFixture.installDirectory,
+            cacheOnly: true,
+            displayBytes: ParakeetModel.v3ShippedBytes, repairable: false, generation: 1),
           progressCallback: nil)
 
         // The closure `ASRManager.cancelInFlightStreamingStart()` triggers: abandon an attempt
@@ -102,7 +109,8 @@ struct ParakeetStreamingGenerationTests {
         await reclaim?.value
 
         await #expect(throws: CancellationError.self) {
-          try await backend.startStreaming(options: .default, generation: abandonedGeneration)
+          try await backend.startStreaming(
+            options: .default, generation: abandonedGeneration, onWindowInferenceEntered: nil)
         }
 
         do {

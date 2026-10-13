@@ -86,13 +86,14 @@ public enum KernelDictationDriverFactory {
   /// emit. A single injected sink therefore observes all of them, so the
   /// cancellation "zero Sentry errors" test catches a regression through any
   /// path — not only the emitter (Codex review #875).
-  package typealias HeartPathCaptureErrorSink = @MainActor (
-    _ error: any Error & StableSentryErrorIdentity,
-    _ category: SentryBreadcrumb.ErrorCategory,
-    _ stage: String,
-    _ extra: [String: Any]?,
-    _ snapshot: SentryBreadcrumb.RecordingSnapshot?
-  ) -> Void
+  package typealias HeartPathCaptureErrorSink =
+    @MainActor (
+      _ error: any Error & StableSentryErrorIdentity,
+      _ category: SentryBreadcrumb.ErrorCategory,
+      _ stage: String,
+      _ extra: [String: Any]?,
+      _ snapshot: SentryBreadcrumb.RecordingSnapshot?
+    ) -> Void
 
   /// The production default — forwards to the global `SentryBreadcrumb`,
   /// including the snapshot (nil collapses to the no-snapshot call, so every
@@ -117,9 +118,11 @@ public enum KernelDictationDriverFactory {
   /// `package` to be shareable across drivers.
   /// #3106 PR B: a checked cleanup kept `takeID`'s dictation (board count `retainedChangeCount`).
   /// The receiver must call `reportShown` exactly once with the overlay's verdict for the notice.
-  package typealias RetainedCallback = @MainActor (
-    _ takeID: String, _ retainedChangeCount: Int, _ reportShown: @escaping @MainActor (Bool) -> Void
-  ) -> Void
+  package typealias RetainedCallback =
+    @MainActor (
+      _ takeID: String, _ retainedChangeCount: Int,
+      _ reportShown: @escaping @MainActor (Bool) -> Void
+    ) -> Void
 
   package struct ParakeetInputs {
     package let audioCapture: any AudioCaptureInterface
@@ -155,10 +158,14 @@ public enum KernelDictationDriverFactory {
     /// that is not the resident one — sharing a handle would throw that answer
     /// away and let a polish be served by other weights.
     package let s1MiniRuntime: (any EGOneEndpointProviding)?
-    /// #1348 Phase 2: Parakeet delivery handle — nil (tests, or a failed
-    /// bundled-manifest load, which a unit test makes can't-happen in
-    /// release) means the legacy in-service download path.
-    package let parakeetDelivery: ParakeetDeliveryHandle?
+    /// #3546: the Parakeet selection-policy owner. It holds the #1348 Phase 2
+    /// delivery handle (nil inside it — tests, or a failed bundled-manifest
+    /// load, which a unit test makes can't-happen in release — means the
+    /// legacy in-service download path) and writes the request provider that
+    /// MUST be the same instance `ASRManager` was built with. Required, no
+    /// default, so a missing wiring fails to compile rather than making every
+    /// load throw `ParakeetModelDirectoryUnsetError`.
+    package let parakeetUpgrade: ParakeetUpgradeCoordinator
     /// #1707 Phase 2: DEBUG fault-injection oracle (§11.1/§3.2a-i) — nil in
     /// every existing test call site.
     package let batchDecodeFaultController: BatchDecodeFaultController?
@@ -196,6 +203,7 @@ public enum KernelDictationDriverFactory {
     package init(
       audioCapture: any AudioCaptureInterface,
       asrManager: any ASRManagerInterface,
+      parakeetUpgrade: ParakeetUpgradeCoordinator,
       vadSignalSource: CaptureVADSignalSource,
       transcriptStore: TranscriptStore,
       keychainManager: KeychainManager,
@@ -208,15 +216,16 @@ public enum KernelDictationDriverFactory {
       microphonePermissionIsDenied: @escaping @MainActor () -> Bool = { false },
       egOneRuntime: (any EGOneEndpointProviding)? = nil,
       s1MiniRuntime: (any EGOneEndpointProviding)? = nil,
-      parakeetDelivery: ParakeetDeliveryHandle? = nil,
       batchDecodeFaultController: BatchDecodeFaultController? = nil,
       escapeRecovery: @escaping PrepareEscapeRecovery = { _, _, _ in false },
-      transcriptionCheckpoint: @escaping @MainActor (TranscriptionCheckpointEvent) -> Void = { _ in },
+      transcriptionCheckpoint: @escaping @MainActor (TranscriptionCheckpointEvent) -> Void = { _ in
+      },
       onTakeAccepted: @escaping @MainActor (String) -> Void = { _ in },
       onRetained: @escaping RetainedCallback = { _, _, report in report(false) }
     ) {
       self.audioCapture = audioCapture
       self.asrManager = asrManager
+      self.parakeetUpgrade = parakeetUpgrade
       self.vadSignalSource = vadSignalSource
       self.transcriptStore = transcriptStore
       self.keychainManager = keychainManager
@@ -229,7 +238,6 @@ public enum KernelDictationDriverFactory {
       self.microphonePermissionIsDenied = microphonePermissionIsDenied
       self.egOneRuntime = egOneRuntime
       self.s1MiniRuntime = s1MiniRuntime
-      self.parakeetDelivery = parakeetDelivery
       self.batchDecodeFaultController = batchDecodeFaultController
       self.escapeRecovery = escapeRecovery
       self.transcriptionCheckpoint = transcriptionCheckpoint
@@ -282,6 +290,10 @@ public enum KernelDictationDriverFactory {
     /// own vendor call against this. Required — no default — so the production
     /// site cannot leave WhisperKit invisible to the engine hold.
     package let vendorDecodeOccupancy: VendorDecodeOccupancy
+    /// #3546 §3.7 T1: the delivered dictation model's identity, read by AppKit
+    /// from the stable WhisperKit manifest; `nil` when no manifest loaded.
+    /// Required, so the production site cannot leave WhisperKit unattributed.
+    package let whisperKitModelIdentity: ASRModelIdentity?
     /// #2087: writes the crash-provenance marker that tells the next launch this
     /// spool was a cancelled-but-kept dictation. Defaults to "cannot prepare", so
     /// a call site that never wires it gets today's destructive cancel rather
@@ -322,6 +334,7 @@ public enum KernelDictationDriverFactory {
       pasteCompletionRegistry: PasteCompletionRegistry,
       engineMutationScope: EngineMutationScope,
       vendorDecodeOccupancy: VendorDecodeOccupancy,
+      whisperKitModelIdentity: ASRModelIdentity?,
       captureErrorSink: @escaping HeartPathCaptureErrorSink = defaultCaptureErrorSink,
       outputClassifierHolder: OutputClassifierHolder? = nil,
       dictationAudioArchiveOptInProvider: @escaping @MainActor () -> Bool = { false },
@@ -330,10 +343,12 @@ public enum KernelDictationDriverFactory {
       s1MiniRuntime: (any EGOneEndpointProviding)? = nil,
       batchDecodeFaultController: BatchDecodeFaultController? = nil,
       escapeRecovery: @escaping PrepareEscapeRecovery = { _, _, _ in false },
-      transcriptionCheckpoint: @escaping @MainActor (TranscriptionCheckpointEvent) -> Void = { _ in },
+      transcriptionCheckpoint: @escaping @MainActor (TranscriptionCheckpointEvent) -> Void = { _ in
+      },
       onTakeAccepted: @escaping @MainActor (String) -> Void = { _ in },
       onRetained: @escaping RetainedCallback = { _, _, report in report(false) }
     ) {
+      self.whisperKitModelIdentity = whisperKitModelIdentity
       self.audioCapture = audioCapture
       self.whisperKitBackend = whisperKitBackend
       self.vendorDecodeOccupancy = vendorDecodeOccupancy
@@ -364,7 +379,7 @@ public enum KernelDictationDriverFactory {
     var recordingStopped: (@MainActor (Int) -> Void)?
     /// #1846: set after the lifecycle sink exists (the kernel is built first),
     /// then called synchronously from `start(config:)` on every accepted session.
-    var sessionAccepted: (@MainActor (String) -> Void)?
+    var sessionAccepted: (@MainActor (String, ASRModelAttribution?) -> Void)?
 
     /// #1884: set after the lifecycle sink exists, for the same construction-order
     /// reason as `sessionAccepted` above. Called from `finishTerminal`'s `defer`
@@ -375,8 +390,8 @@ public enum KernelDictationDriverFactory {
       recordingStopped?(sampleCount)
     }
 
-    func establishTakeID(_ takeID: String) {
-      sessionAccepted?(takeID)
+    func establishTakeID(_ takeID: String, model: ASRModelAttribution?) {
+      sessionAccepted?(takeID, model)
     }
 
     func deliverSessionTerminal(_ snapshot: KernelTerminalTelemetrySnapshot) {
@@ -425,7 +440,7 @@ public enum KernelDictationDriverFactory {
     // longer names a concrete adapter type in code (EngineIdentityFreezeTests
     // Test B); it assembles around the opaque `any ASREngineAdapter` returned.
     let adapter = KernelAdapterFactory.makeParakeetAdapter(
-      asrManager: inputs.asrManager, delivery: inputs.parakeetDelivery,
+      asrManager: inputs.asrManager, parakeetUpgrade: inputs.parakeetUpgrade,
       batchDecodeFaultController: inputs.batchDecodeFaultController)
     return assembleDriver(
       adapter: adapter,
@@ -478,6 +493,7 @@ public enum KernelDictationDriverFactory {
       audioCaptureSessionIDSource: { captureSource.currentCaptureSessionID },
       engineMutationScope: inputs.engineMutationScope,
       vendorDecodeOccupancy: inputs.vendorDecodeOccupancy,
+      deliveredModelIdentity: inputs.whisperKitModelIdentity,
       batchDecodeFaultController: inputs.batchDecodeFaultController)
     return assembleDriver(
       adapter: adapter,
@@ -704,23 +720,24 @@ public enum KernelDictationDriverFactory {
       // kernel-side telemetry closure is.
       // #2087 Q4: injected from the composition root, exactly as the marker
       // writer is — the factory owns no UI.
-      escapeRecoveryStartedTelemetry: { backend, provider, durationMs, takeID in
+      escapeRecoveryStartedTelemetry: { backend, provider, durationMs, takeID, model in
         TelemetryService.shared.escapeRecoveryStarted(
           asrBackend: backend, polishProvider: provider,
-          recordingDurationMs: durationMs, takeID: takeID)
+          recordingDurationMs: durationMs, takeID: takeID, model: model)
       },
       // #1946 chunk 2: the retry-deadline observation, routed the same way.
-      asrRetryDeadlineStartedTelemetry: { takeID, backend, budgetMs in
+      asrRetryDeadlineStartedTelemetry: { takeID, backend, budgetMs, model in
         TelemetryService.shared.asrRetryDeadlineStarted(
-          takeID: takeID, asrBackend: backend, budgetMs: budgetMs)
+          takeID: takeID, asrBackend: backend, budgetMs: budgetMs, model: model)
       },
       asrRetryDeadlineResolvedTelemetry: {
         takeID, backend, budgetMs, resolution, disposition, operationReturnMs, callerResumeMs,
-        acceptedAfterCutoff in
+        acceptedAfterCutoff, model in
         TelemetryService.shared.asrRetryDeadlineResolved(
           takeID: takeID, asrBackend: backend, budgetMs: budgetMs, resolution: resolution,
           disposition: disposition, operationReturnMs: operationReturnMs,
-          callerResumeMs: callerResumeMs, acceptedAfterCutoff: acceptedAfterCutoff)
+          callerResumeMs: callerResumeMs, acceptedAfterCutoff: acceptedAfterCutoff,
+          model: model)
       },
       engineMutationScope: engineMutationScope,
       transcriptionCheckpoint: transcriptionCheckpoint,
@@ -772,8 +789,8 @@ public enum KernelDictationDriverFactory {
       },
       // #1846 cloud review: routed through the relay for the same reason as the
       // line above — the kernel is constructed BEFORE the lifecycle sink.
-      sessionAcceptedTelemetry: { takeID in
-        telemetryRelay.establishTakeID(takeID)
+      sessionAcceptedTelemetry: { takeID, model in
+        telemetryRelay.establishTakeID(takeID, model: model)
       },
       // #1884: same relay, same reason — the kernel is constructed before the
       // lifecycle sink, so the terminal callback cannot reference it directly.
@@ -860,8 +877,8 @@ public enum KernelDictationDriverFactory {
     // #1884: acceptance now activates BOTH effects through one sink method — the
     // Sentry take tag (unchanged single writer) and the `dictation.started`
     // denominator. One identity, no second callback.
-    telemetryRelay.sessionAccepted = { [lifecycleSink] takeID in
-      lifecycleSink.acceptSession(takeID: takeID)
+    telemetryRelay.sessionAccepted = { [lifecycleSink] takeID, model in
+      lifecycleSink.acceptSession(takeID: takeID, model: model)
       // #3106 PR B: after the sink, so the take AppKit learns is the one telemetry now names.
       onTakeAccepted(takeID)
     }

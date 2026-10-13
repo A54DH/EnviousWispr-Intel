@@ -37,7 +37,7 @@ COMPONENTS=(
   # text too, not just Argmax's MIT LICENSE (Codex audit 2026-07-10). Empty
   # identity — it is vendored inside argmax-oss-swift, not its own SwiftPM pin.
   "swift-transformers (incorporated into Argmax OSS)|n/a|Apache-2.0|argmax-oss-swift/NOTICES|https://github.com/huggingface/swift-transformers|"
-  "FluidAudio|b29591ad (fork saurabhav88/FluidAudio)|Apache-2.0|FluidAudio/LICENSE|https://github.com/saurabhav88/FluidAudio|fluidaudio"
+  "FluidAudio|fb506037 (fork saurabhav88/FluidAudio)|Apache-2.0|FluidAudio/LICENSE|https://github.com/saurabhav88/FluidAudio|fluidaudio"
   "PostHog iOS|3.89.0|MIT|posthog-ios/LICENSE|https://github.com/PostHog/posthog-ios|posthog-ios"
   "Sentry Cocoa|9.30.0|MIT|sentry-cocoa/LICENSE.md|https://github.com/getsentry/sentry-cocoa|sentry-cocoa"
   "Sparkle|2.10.0|MIT (with bundled BSD/MIT components)|Sparkle/LICENSE|https://github.com/sparkle-project/Sparkle|sparkle"
@@ -65,7 +65,9 @@ COMPONENTS=(
   # aggregate license file carries the NVIDIA NeMo Text Processing, rustfst,
   # and Rust-crate attributions the binary embeds. Empty identity — a binary
   # target inside FluidAudio, not its own SwiftPM pin.
-  "NemoTextProcessing / text-processing-rs (bundled in FluidAudio)|v0.3.0|Apache-2.0 (aggregating Apache-2.0/MIT components)|FluidAudio/ThirdPartyLicenses/NemoTextProcessing-LICENSE.md|https://github.com/FluidInference/text-processing-rs|"
+  # #3546: no longer linked. Package.swift declares FluidAudio with `traits: []`,
+  # which drops the `NemoTextProcessing` trait and its binary target, so the row
+  # is removed. The guard below fails if that opt-out disappears.
   "PLCrashReporter + protobuf-c (bundled in PostHog)|n/a|MIT / Apache-2.0 / BSD-2-Clause|posthog-ios/vendor/PHPLCrashReporter/LICENSE|https://github.com/microsoft/plcrashreporter|"
   "libwebp (bundled in PostHog)|n/a|BSD-3-Clause|posthog-ios/vendor/libwebp/COPYING|https://chromium.googlesource.com/webm/libwebp|"
   # llama.cpp is NOT a SwiftPM dep — the bundled llama-server binary is built
@@ -166,6 +168,63 @@ for entry in "${COMPONENTS[@]}"; do
     miss=1
   fi
 done
+# #3546: the NemoTextProcessing row was removed because Package.swift opts out of
+# FluidAudio's default trait. If that opt-out is gone, the binary is linked again
+# and would ship without its attribution.
+if ! python3 - "$PROJ_ROOT" <<'PY'
+import json
+import subprocess
+import sys
+
+root = sys.argv[1]
+result = subprocess.run(
+    ["swift", "package", "dump-package", "--package-path", root],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+package = json.loads(result.stdout)
+
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from strings(child)
+
+def trait_fields(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "traits":
+                yield child
+            else:
+                yield from trait_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from trait_fields(child)
+
+urls = {
+    "https://github.com/saurabhav88/FluidAudio",
+    "https://github.com/saurabhav88/FluidAudio.git",
+}
+dependencies = package["dependencies"]
+matches = [
+    dependency for dependency in dependencies
+    if urls.intersection(strings(dependency))
+]
+if len(matches) != 1:
+    raise SystemExit("expected exactly one FluidAudio fork dependency")
+fields = list(trait_fields(matches[0]))
+if fields != [[]]:
+    raise SystemExit("FluidAudio must explicitly disable all traits")
+PY
+then
+  echo "error: cannot verify FluidAudio's trait opt-out. Restore the opt-out or its notices attribution." >&2
+  miss=1
+fi
 [[ "$miss" -eq 1 ]] && exit 1
 
 # --check (release gate): verify the COMMITTED notices file actually carries each
@@ -265,14 +324,34 @@ done
 printf -- '--------------------------------------------------------------------------------\n'
 printf 'Speech recognition model (downloaded at runtime, NOT bundled in this DMG)\n'
 printf -- '--------------------------------------------------------------------------------\n\n'
-printf 'EnviousWispr downloads the Parakeet TDT speech model (CoreML) from Hugging\n'
-printf 'Face on first use; it is not distributed inside this disk image. The model\n'
-printf 'is provided under CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/).\n'
-printf 'Source: https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml\n'
+# #3546: Parakeet Ultra is CC-BY-4.0 and we SERVE its bytes (models.enviouswispr.com,
+# Hugging Face as backup), so the attribution names every contributor in the chain,
+# their sources and the licence, and says what our transport does to the bytes.
+printf 'Parakeet Ultra (CoreML)\n'
+printf '  Version: Hugging Face revision 95eaa59a (FluidInference/parakeet-ultra-coreml)\n'
+printf '  License: CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)\n'
+printf '  Source:  https://huggingface.co/FluidInference/parakeet-ultra-coreml\n\n'
+printf 'EnviousWispr downloads this speech model on first use, or in the background\n'
+printf 'for existing users; it is not distributed inside this disk image. The files\n'
+printf 'are served from models.enviouswispr.com, with the Hugging Face revision above\n'
+printf 'as a backup source. Attribution:\n'
+printf '  - Base model: nvidia/parakeet-tdt-0.6b-v3 by NVIDIA, CC-BY-4.0\n'
+printf '    (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)\n'
+printf '  - Post-training: moondream/parakeet-ultra by moondream, CC-BY-4.0\n'
+printf '    (https://huggingface.co/moondream/parakeet-ultra)\n'
+printf '  - Core ML conversion: FluidInference/parakeet-ultra-coreml by FluidInference,\n'
+printf '    CC-BY-4.0 (https://huggingface.co/FluidInference/parakeet-ultra-coreml)\n'
+printf 'Envious Labs did not modify the model. To fit our download cache, the encoder\n'
+printf 'weights file is transferred in two pieces that the app joins back together;\n'
+printf 'the installed file is byte-identical to the publisher'"'"'s file and is checked\n'
+printf 'against its published SHA-256 before use.\n\n'
+printf 'Earlier versions used Parakeet TDT 0.6B v3 (CoreML), CC-BY-4.0, from\n'
+printf 'https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml (base model\n'
+printf 'nvidia/parakeet-tdt-0.6b-v3 by NVIDIA). An existing copy keeps working until\n'
+printf 'Parakeet Ultra is ready, and is then removed.\n'
 
-# S1-mini differs from Parakeet above in the one way that changes our
-# obligations: we SERVE its bytes from models.enviouswispr.com rather than
-# pointing the app at the publisher, which makes us a redistributor under
+# S1-mini is, like Parakeet Ultra above, SERVED by us from models.enviouswispr.com
+# rather than by its publisher, which makes us a redistributor under
 # Apache-2.0 section 4. That owes recipients a copy of the licence (4a) and the
 # NOTICE attributions (4d). The text is CAT'd from the same bundled resources
 # the app ships, never restated, so this section cannot drift away from them.

@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import EnviousWisprAudio
 import EnviousWisprCore
+import EnviousWisprPipeline
 import Foundation
 import Testing
 
@@ -41,7 +42,8 @@ struct ActiveEngineLoadPostconditionTests {
     manager.readyAfterLoad = false
 
     let op = ActiveEngineOperation.live(
-      asrManager: manager, whisperKitBackend: Self.unusedBackend())
+      asrManager: manager, parakeetUpgrade: .legacyForTesting(),
+      whisperKitBackend: Self.unusedBackend())
 
     await #expect(throws: ASREngineNotReadyAfterLoadError.self) {
       try await op.load()
@@ -59,7 +61,8 @@ struct ActiveEngineLoadPostconditionTests {
     #expect(manager.isModelLoaded == false, "cold: a pre-load guard would refuse here")
 
     let op = ActiveEngineOperation.live(
-      asrManager: manager, whisperKitBackend: Self.unusedBackend())
+      asrManager: manager, parakeetUpgrade: .legacyForTesting(),
+      whisperKitBackend: Self.unusedBackend())
 
     try await op.load()
     #expect(manager.isModelLoaded, "the loader made it ready and the postcondition agreed")
@@ -104,8 +107,10 @@ struct ReadinessRetryTelemetryContractTests {
     let manager = RecoverySpoolReplayerTests.FakeBatchASR()
     manager.readyAfterLoad = false
     let engine = ActiveEngineOperation.live(
-      asrManager: manager, whisperKitBackend: WhisperKitBackend(admittedModelFolder: { nil }))
-    let suite = BenchmarkSuite(engineMutationScope: .alwaysAllowedForTesting)
+      asrManager: manager, parakeetUpgrade: .legacyForTesting(),
+      whisperKitBackend: WhisperKitBackend(admittedModelFolder: { nil }))
+    let suite = BenchmarkSuite(
+      engineMutationScope: .alwaysAllowedForTesting, isEngineSwitching: { false })
 
     await suite.run(activeEngine: engine)
     #expect(suite.lastFailure != nil, "a load that returns unready must SAY so")
@@ -116,6 +121,33 @@ struct ReadinessRetryTelemetryContractTests {
     #expect(
       suite.lastFailure == nil,
       "a successful run must not leave the previous run's error on screen")
+  }
+
+  /// #3546 A3: when this fails, a speed test started during an engine switch or the
+  /// in-session Parakeet Ultra activation loads and decodes on the engine being replaced.
+  @Test("both benchmark entry points refuse during an engine switch and touch nothing")
+  @MainActor
+  func bothBenchmarkEntryPointsRefuseDuringASwitch() async {
+    let manager = RecoverySpoolReplayerTests.FakeBatchASR()
+    // Unready, so a run that got past the gate would fail with the load message instead.
+    manager.readyAfterLoad = false
+    let engine = ActiveEngineOperation.live(
+      asrManager: manager, parakeetUpgrade: .legacyForTesting(),
+      whisperKitBackend: WhisperKitBackend(admittedModelFolder: { nil }))
+    let lease = EngineLease()
+    var released = 0
+    lease.onReleased = { released += 1 }
+    let suite = BenchmarkSuite(
+      engineMutationScope: .alwaysAllowedForTesting, engineLease: lease,
+      isEngineSwitching: { true })
+    let busy = "The engine is busy. Try again in a moment."
+
+    await suite.run(activeEngine: engine)
+    #expect(suite.lastFailure == busy)
+    await suite.runPipelineBenchmark(using: manager, activeEngine: engine)
+    #expect(suite.lastFailure == busy)
+    #expect(manager.isModelLoaded == false)
+    #expect(released == 0, "no lease was taken")
   }
 
   /// Codex diff review: without this the Diagnostics row renders Foundation's
@@ -203,7 +235,7 @@ struct ReadinessRetryTelemetryContractTests {
         activeEngine: ActiveEngineOperation(
           isLoaded: { asr.isModelLoaded },
           load: { try await asr.loadModel() },
-          transcribe: { samples, options in
+          transcribe: { samples, options, _ in
             try await asr.transcribe(audioSamples: samples, options: options)
           },
           hardCancel: {}),

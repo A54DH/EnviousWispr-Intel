@@ -1,4 +1,5 @@
 import EnviousWisprASR
+import EnviousWisprCore
 import Foundation
 import Testing
 
@@ -40,13 +41,31 @@ final class DeliveryStubProtocol: URLProtocol {
   /// can prove which source and which representation (part or whole) was asked for.
   nonisolated(unsafe) static var seenRequests: [String] = []
   static let lock = NSLock()
+  /// #3546: path prefixes owned by one test rig. Their stubs survive a
+  /// `reset()` from a suite running concurrently, and their requests are
+  /// recorded apart from the shared list, so that rig counts only its own.
+  nonisolated(unsafe) static var scopedPrefixes: Set<String> = []
+  nonisolated(unsafe) static var scopedRequests: [String: [String]] = [:]
 
   static func reset() {
     lock.lock()
-    stubs = [:]
+    defer { lock.unlock() }
+    stubs = stubs.filter { entry in scopedPrefixes.contains { entry.key.hasPrefix($0) } }
     seenRangeHeaders = []
     seenRequests = []
-    lock.unlock()
+  }
+
+  static func beginScope(pathPrefix: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    scopedPrefixes.insert(pathPrefix)
+    scopedRequests[pathPrefix] = []
+  }
+
+  static func requests(in pathPrefix: String) -> [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return scopedRequests[pathPrefix, default: []]
   }
 
   static var requests: [String] {
@@ -72,11 +91,16 @@ final class DeliveryStubProtocol: URLProtocol {
 
   override func startLoading() {
     Self.lock.lock()
-    if let range = request.value(forHTTPHeaderField: "Range") {
-      Self.seenRangeHeaders.append(range)
-    }
-    Self.seenRequests.append("\(request.httpMethod ?? "GET") \(request.url!.absoluteString)")
     let key = request.url!.path
+    let recorded = "\(request.httpMethod ?? "GET") \(request.url!.absoluteString)"
+    if let scope = Self.scopedPrefixes.first(where: { key.hasPrefix($0) }) {
+      Self.scopedRequests[scope, default: []].append(recorded)
+    } else {
+      if let range = request.value(forHTTPHeaderField: "Range") {
+        Self.seenRangeHeaders.append(range)
+      }
+      Self.seenRequests.append(recorded)
+    }
     let stub = Self.stubs[key]?.isEmpty == false ? Self.stubs[key]!.removeFirst() : nil
     Self.lock.unlock()
     guard let stub else {
@@ -801,7 +825,10 @@ final class DeliveryStubProtocol: URLProtocol {
     let handle = ParakeetDeliveryHandle(
       controller: controller, registration: registration,
       defaults: TestDefaults.suite(suite)!)
-    let adapter = ParakeetEngineAdapter(asrManager: StubParakeetASRManager(), delivery: handle)
+    let selection = ParakeetSelectionProvider()
+    let adapter = ParakeetEngineAdapter(
+      asrManager: StubParakeetASRManager(),
+      parakeetUpgrade: ParakeetUpgradeCoordinator(parakeetSelection: selection, delivery: handle))
 
     DeliveryStubProtocol.reset()
     ChunkAppendDelegate.protocolClassesForTesting = [DeliveryStubProtocol.self]
@@ -820,7 +847,7 @@ final class DeliveryStubProtocol: URLProtocol {
     await controller.addStateObserver { _, state in
       if case .downloading = state { Task { await inflight.fire() } }
     }
-    let warm = Task { @MainActor in try? await adapter.warmUp() }
+    let warm = Task { @MainActor in try? await adapter.warmUp(modelReceipt: nil) }
     await inflight.wait()
 
     // A model-LOAD wedge recovery must leave the in-flight download alone.
@@ -839,6 +866,96 @@ final class DeliveryStubProtocol: URLProtocol {
     // Cleanup: the stub hangs forever, so cancel explicitly to unblock warmUp.
     _ = await controller.cancel(registration.manifest.identity)
     _ = await warm.value
+
+    // #3546: with delivery on, the warm-up wrote ONE cache-only request for our
+    // install directory before the download began, carrying this manifest's
+    // revision and byte total. A cancel does not clear it.
+    let request = try #require(selection.current)
+    #expect(request.model == .v3)
+    #expect(request.directory == install)
+    #expect(request.cacheOnly)
+    #expect(request.repairable)
+    #expect(request.revision == manifest.identity.revision)
+    #expect(request.displayBytes == manifest.totalBytes)
+  }
+}
+
+extension ManifestFetchTaskTests {
+  /// #3546: two Parakeet preparations asked for together (a launch warm-up and a
+  /// direct load) run the delivery stage ONCE and share its request; the
+  /// selection point they were asked for is consumed. Lives in this serialized
+  /// suite because it drives the shared `DeliveryStubProtocol`.
+  @MainActor
+  @Test func concurrentPreparationsShareOneDeliveryStage() async throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("prepare-\(UUID().uuidString)", isDirectory: true)
+    let install = root.appendingPathComponent("install", isDirectory: true)
+    let metadata = root.appendingPathComponent("metadata", isDirectory: true)
+    try FileManager.default.createDirectory(at: install, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: true)
+    let tag = UUID().uuidString
+    let host = "https://prepare.invalid.example/\(tag)/"
+    let files = ManifestFixture.smallFiles
+    let manifest = try DeliveryManifest.load(
+      from: ManifestFixture.manifestJSON(
+        files: files,
+        sources: [["id": "our_copy", "baseURL": host], ["id": "backup", "baseURL": host]]))
+    let registration = DeliveryRegistration(
+      manifest: manifest, installDirectory: install, metadataDirectory: metadata)
+    let suite = "test.prepare.\(UUID().uuidString)"
+    let controller = ModelDeliveryController(
+      defaults: TestDefaults.suite(suite)!, availableDiskBytes: { _ in .max })
+    let handle = ParakeetDeliveryHandle(
+      controller: controller, registration: registration, defaults: TestDefaults.suite(suite)!)
+    let selection = ParakeetSelectionProvider()
+    let coordinator = ParakeetUpgradeCoordinator(parakeetSelection: selection, delivery: handle)
+
+    // Scoped to this rig: the shared request list is also written by suites that run
+    // concurrently with this one.
+    DeliveryStubProtocol.beginScope(pathPrefix: "/\(tag)/")
+    ChunkAppendDelegate.protocolClassesForTesting = [DeliveryStubProtocol.self]
+    for f in files {
+      DeliveryStubProtocol.enqueue(
+        url: URL(string: host)!.appendingPathComponent(f.path).absoluteString,
+        .init(
+          status: 200, headers: ["Content-Length": String(f.content.count), "ETag": "\"e\""],
+          body: f.content))
+    }
+
+    coordinator.markSelectionPoint()
+    #expect(coordinator.hasPendingSelectionPoint)
+    async let first = coordinator.prepareLoad()
+    async let second = coordinator.prepareLoad()
+    let (a, b) = try await (first, second)
+    #expect(a.selection == b.selection)
+    let request = try #require(selection.current)
+    #expect(request.generation == 1, "one delivery stage published one request")
+    #expect(request.directory == install)
+    #expect(request.cacheOnly)
+    #expect(
+      DeliveryStubProtocol.requests(in: "/\(tag)/").filter { $0.hasPrefix("GET ") }.count
+        == files.count)
+    #expect(coordinator.hasPendingSelectionPoint == false)
+    #expect(await controller.isAdmitted(registration))
+  }
+}
+
+/// #3546: per-rig stub scopes survive this suite's shared `reset()`. Lives in
+/// the reset-owning suite so no other suite becomes a competing reset caller.
+extension ManifestFetchTaskTests {
+  @MainActor
+  @Test("a rig's scoped stubs and request records survive a shared stub reset")
+  func scopedStubsSurviveReset() async throws {
+    let rig = try await ParakeetUpgradePolicyTests.rig(v3: false, ultra: false)
+    ParakeetUpgradePolicyTests.enqueueUltra(rig)
+    DeliveryStubProtocol.reset()
+    let prepared = try await rig.coordinator.prepareLoad()
+    #expect(prepared.selection?.model == .ultra, "the queued responses were still served")
+    let fetched = ParakeetUpgradePolicyTests.ultraRequests(rig)
+    #expect(fetched > 0)
+    DeliveryStubProtocol.reset()
+    #expect(
+      ParakeetUpgradePolicyTests.ultraRequests(rig) == fetched, "the scoped record is not cleared")
   }
 }
 

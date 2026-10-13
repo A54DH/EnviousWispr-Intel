@@ -1,4 +1,5 @@
 import CryptoKit
+import EnviousWisprCore
 import EnviousWisprPostProcessing
 import Foundation
 import Testing
@@ -146,7 +147,10 @@ enum ManifestFixture {
     }
     #expect(throws: (any Error).self) { try DeliveryManifest.load(from: short) }
     // Absent stays fine (every pre-v1.4 manifest).
-    #expect(try DeliveryManifest.load(from: ManifestFixture.manifestJSON(files: ManifestFixture.smallFiles)).runtimeIdentityDigest == nil)
+    #expect(
+      try DeliveryManifest.load(
+        from: ManifestFixture.manifestJSON(files: ManifestFixture.smallFiles)
+      ).runtimeIdentityDigest == nil)
   }
 
   @Test func whisperKitCarveOutForNonOurCopyPrimarySource() throws {
@@ -461,11 +465,15 @@ enum ManifestFixture {
           packageSHA256: "984ac8f85c749e30ccebb1ecfc1170b7fd94d1c90d9ba80f4d3c02c09106013e",
           tokenizerSHA256: "a068687ff92c2c7d59523d2582f39ded9d12c02a0c0e6d34be29eef9ca93dfdd",
           configSHA256: "abd9df99745c60dcfe982fda982b25bd486966129893ae4a5f6f249439223f44"))
-    #expect(manifest.runtimeIdentityDigest == "73d1c5147945dff0b7aa8ba0bd5de8669750955eaf4f51895c1741b4575adb2a")
+    #expect(
+      manifest.runtimeIdentityDigest
+        == "73d1c5147945dff0b7aa8ba0bd5de8669750955eaf4f51895c1741b4575adb2a")
     // Qualified (2026-09-26): the shipped table names exactly this digest, so
     // the fetch policy may start the download; the bundled manifest and the
     // qualification row cannot drift apart without this line going red.
-    #expect(CorrectionJudgeArmSelection.classifierIsQualifiedSomewhere(digest: manifest.runtimeIdentityDigest, osMajor: 27) == true)
+    #expect(
+      CorrectionJudgeArmSelection.classifierIsQualifiedSomewhere(
+        digest: manifest.runtimeIdentityDigest, osMajor: 27) == true)
     // One row per supported major, every row naming the delivered bytes and
     // its own receipt (27: the conversion receipt on the founder's Mac; 26, 15
     // and 14: the founder's 2026-09-26 decision not to run older macOS).
@@ -478,11 +486,21 @@ enum ManifestFixture {
         $0.configDigest == manifest.runtimeIdentityDigest && $0.osMajors.count == 1
       })
     #expect(Set(classifierRows.compactMap { $0.osMajors.first }) == [14, 15, 26, 27])
-    #expect(Set(classifierRows.map(\.receipt)).count == classifierRows.count, "each major cites its own receipt")
-    #expect(classifierRows.first { $0.osMajors == [27] }?.receipt == "2026-09-25T23-25-51Z-xenc-mmbert-small-v31-spell-fp16-conversion-macos27")
-    #expect(classifierRows.first { $0.osMajors == [26] }?.receipt == "founder-2026-09-26-no-older-macos-runs-v31-macos26")
-    #expect(classifierRows.first { $0.osMajors == [15] }?.receipt == "founder-2026-09-26-no-older-macos-runs-v31-macos15")
-    #expect(classifierRows.first { $0.osMajors == [14] }?.receipt == "founder-2026-09-26-no-older-macos-runs-v31-macos14")
+    #expect(
+      Set(classifierRows.map(\.receipt)).count == classifierRows.count,
+      "each major cites its own receipt")
+    #expect(
+      classifierRows.first { $0.osMajors == [27] }?.receipt
+        == "2026-09-25T23-25-51Z-xenc-mmbert-small-v31-spell-fp16-conversion-macos27")
+    #expect(
+      classifierRows.first { $0.osMajors == [26] }?.receipt
+        == "founder-2026-09-26-no-older-macos-runs-v31-macos26")
+    #expect(
+      classifierRows.first { $0.osMajors == [15] }?.receipt
+        == "founder-2026-09-26-no-older-macos-runs-v31-macos15")
+    #expect(
+      classifierRows.first { $0.osMajors == [14] }?.receipt
+        == "founder-2026-09-26-no-older-macos-runs-v31-macos14")
 
     let byPath = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
     // Everything `CoreMLCorrectionJudge.load` reads from a delivered folder.
@@ -490,20 +508,26 @@ enum ManifestFixture {
     #expect(byPath["training-manifest.json"] == nil)
     for required in [
       "training-manifest-shaped.json", "verification.json", "tokenizer-contract.json",
-      "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json", "tokenizer/special_tokens_map.json",
+      "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json",
+      "tokenizer/special_tokens_map.json",
       "xenc-mmbert-small-fp16.mlpackage/Manifest.json",
       "xenc-mmbert-small-fp16.mlpackage/Data/com.apple.CoreML/model.mlmodel",
       "xenc-mmbert-small-fp16.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
     ] {
       #expect(byPath[required] != nil, "missing file \(required)")
     }
-    #expect(byPath["xenc-mmbert-small-fp16.mlpackage/Data/com.apple.CoreML/weights/weight.bin"]?.sha256 == Self.weightsSHA256)
-    #expect(byPath["xenc-mmbert-small-fp16.mlpackage/Data/com.apple.CoreML/weights/weight.bin"]?.sizeBytes == 281_038_400)
+    #expect(
+      byPath["xenc-mmbert-small-fp16.mlpackage/Data/com.apple.CoreML/weights/weight.bin"]?.sha256
+        == Self.weightsSHA256)
+    #expect(
+      byPath["xenc-mmbert-small-fp16.mlpackage/Data/com.apple.CoreML/weights/weight.bin"]?.sizeBytes
+        == 281_038_400)
     // Fetch path and install path coincide: the staged folder IS the install layout,
     // and every file's component is its top path segment (contract §4c).
     for file in manifest.files {
       #expect(file.resolvedInstallPath == file.path)
-      #expect(file.component == String(file.path.split(separator: "/")[0]), Comment(rawValue: file.path))
+      #expect(
+        file.component == String(file.path.split(separator: "/")[0]), Comment(rawValue: file.path))
     }
     #expect(manifest.admission.entrypointFile == "training-manifest-shaped.json")
     #expect(manifest.admission.evictPreviousRevisions == true)
@@ -546,6 +570,45 @@ enum ManifestFixture {
       "Sources/EnviousWispr/Resources/parakeet-delivery-manifest.json")
   }
 
+  /// #3546: the v3 manifest, kept byte-identical so an installed v3 can still
+  /// be accepted while Ultra arrives.
+  static var retiredV3ManifestURL: URL {
+    repoRoot.appendingPathComponent(
+      "Sources/EnviousWispr/Resources/parakeet-v3-retired-manifest.json")
+  }
+
+  /// #3546 (2026-10-11): the shipped Parakeet is Ultra at the pinned upstream
+  /// revision, served from our copy (the encoder in two parts) with the
+  /// pinned Hugging Face revision as backup. The bytes were verified against
+  /// the public copy (`docs/audits/3546-ship/chunk8-public-verify.json`).
+  /// `runtimeABI` is fork pin fb506037 (the live inference-entry hook, requalified
+  /// in `docs/audits/3546-ship/signal-requal/result.md`); regenerated with
+  /// `scripts/regen-delivery-manifest-digest.py --write`, control OK.
+  static let shippedUltraGoldenDigest =
+    "a66864c7c96ca8fccfb00f50f784f02aa2275dc58d6f7b1d9d415120b97bdc7d"
+
+  @Test func shippedManifestIsUltraAndMatchesGoldenDigest() throws {
+    let data = try Data(contentsOf: Self.shippedManifestURL)
+    let manifest = try DeliveryManifest.load(from: data)
+    #expect(manifest.manifestDigest == Self.shippedUltraGoldenDigest)
+    #expect(try DeliveryManifest.canonicalDigest(of: data) == Self.shippedUltraGoldenDigest)
+    #expect(manifest.identity.name == "parakeet-ultra-coreml")
+    #expect(manifest.identity.revision == "95eaa59a39d4394f047a4dc5cce480388a60d1b6")
+    // #3546 §3.7 T1: telemetry names the model with these Core literals.
+    #expect(ParakeetModel.ultra.manifestName == manifest.identity.name)
+    #expect(ParakeetModel.ultra.manifestVariant == manifest.identity.variant)
+    #expect(manifest.files.count == 20)
+    #expect(manifest.totalBytes == 632_314_500)
+    #expect(manifest.sources.map(\.id) == ["our_copy", "backup"])
+    let components = Set(manifest.files.map(\.component))
+    for required in [
+      "Encoder.mlmodelc", "Decoder.mlmodelc", "JointDecisionv3.mlmodelc",
+      "Preprocessor.mlmodelc", "parakeet_vocab.json",
+    ] {
+      #expect(components.contains(required), "missing component \(required)")
+    }
+  }
+
   /// The committed golden digest: the Python authoring validator and the
   /// Swift loader MUST both reproduce it (one canonicalization, two
   /// implementations — a drift here would reject a valid manifest at
@@ -579,15 +642,19 @@ enum ManifestFixture {
   // chunk-text assembly half of the fresh-state carry retired). Identical model bytes
   // (`identity.revision` unchanged) — the same re-admission-without-re-download case.
   // Regenerated with `scripts/regen-delivery-manifest-digest.py --write`, control OK.
+  // Updated 2026-10-11 (#3546): this digest now pins the retired v3 manifest,
+  // a byte-identical copy of the last shipped v3 manifest.
   static let goldenDigest = "2564836e6f6e1eaffda0485d2bef49cc9bbcfb654a49737ae820320a9d3bdcc6"
 
-  @Test func shippedManifestLoadsAndMatchesGoldenDigest() throws {
-    let data = try Data(contentsOf: Self.shippedManifestURL)
+  @Test func retiredV3ManifestLoadsAndMatchesGoldenDigest() throws {
+    let data = try Data(contentsOf: Self.retiredV3ManifestURL)
     let manifest = try DeliveryManifest.load(from: data)
     #expect(manifest.manifestDigest == Self.goldenDigest)
     #expect(try DeliveryManifest.canonicalDigest(of: data) == Self.goldenDigest)
     #expect(manifest.identity.name == "parakeet-tdt-0.6b-v3-coreml")
     #expect(manifest.identity.revision == "aed02740059203c4a87495924f685de3722ae9ce")
+    #expect(ParakeetModel.v3.manifestName == manifest.identity.name)
+    #expect(ParakeetModel.v3.manifestVariant == manifest.identity.variant)
     #expect(manifest.files.count == 23)
     #expect(manifest.totalBytes == 483_256_769)
     #expect(manifest.sources.map(\.id) == ["our_copy", "backup"])
@@ -610,12 +677,17 @@ enum ManifestFixture {
     #expect(
       project.contains("Sources/EnviousWispr/Resources/parakeet-delivery-manifest.json"),
       "parakeet-delivery-manifest.json must be listed in the app target's resources")
+    #expect(
+      project.contains("Sources/EnviousWispr/Resources/parakeet-v3-retired-manifest.json"),
+      "parakeet-v3-retired-manifest.json must be listed in the app target's resources")
   }
 
   /// Cross-artifact gate (PR-2a/PR-2b): every (path, size, sha256) in the
-  /// shipped manifest matches the mirror Worker's byte-verified seed.
-  @Test func shippedManifestMatchesWorkerSeed() throws {
-    let manifest = try DeliveryManifest.load(from: Data(contentsOf: Self.shippedManifestURL))
+  /// v3 manifest matches the mirror Worker's byte-verified seed. #3546: the
+  /// Worker still serves v3 to released builds and is unchanged, so its seed
+  /// is checked against the retired v3 manifest, not the shipped Ultra one.
+  @Test func retiredV3ManifestMatchesWorkerSeed() throws {
+    let manifest = try DeliveryManifest.load(from: Data(contentsOf: Self.retiredV3ManifestURL))
     let seedData = try Data(
       contentsOf: Self.repoRoot.appendingPathComponent(
         "workers/parakeet-mirror/expected-manifest.json"))
@@ -927,9 +999,10 @@ struct S1MiniShippedManifestTests {
     #expect(manifest.checkerContract == nil)
     #expect(manifest.files.count == 10)
     #expect(manifest.totalBytes == 501_240_383)
-    #expect(manifest.sources.map(\.baseURL.absoluteString) == [
-      "https://models.enviouswispr.com/kev/kev-wc-2-bf2af137/"
-    ])
+    #expect(
+      manifest.sources.map(\.baseURL.absoluteString) == [
+        "https://models.enviouswispr.com/kev/kev-wc-2-bf2af137/"
+      ])
     // The runtime reads these by name; a manifest that drops one admits a folder the loader refuses.
     let names = Set(manifest.files.map(\.path))
     for required in [

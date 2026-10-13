@@ -126,6 +126,12 @@ extension ParakeetOfflineModeConflictError: StableSentryErrorIdentity {
   public var sentrySemanticID: String { "asr.offline_mode_conflict" }
 }
 
+/// #3546 §3.7 T1: observation only. Called SYNCHRONOUSLY at the native-call boundary, after
+/// the last cancellation check and with no suspension before the vendor call, so a recorded
+/// entry always means the vendor call was made. Passed WITH the call it observes, never
+/// installed on a shared object. It must not block, await or throw.
+public typealias ASRInferenceEntryObserver = @Sendable () -> Void
+
 /// Abstraction over ASR management — enables swapping between in-process and XPC implementations.
 ///
 /// `ASRManager` (in-process) and `ASRManagerProxy` (XPC) both conform to this protocol.
@@ -136,6 +142,10 @@ public protocol ASRManagerInterface: AnyObject {
   var activeBackendType: ASRBackendType { get }
   var isModelLoaded: Bool { get }
   var isStreaming: Bool { get }  // periphery:ignore - read via existential type (ASRManagerProxy)
+  /// #3546 §3.7 T1: the identity of the model published READY right now, or
+  /// `nil` when nothing is loaded. Telemetry sends `nil` as an absent model,
+  /// never as a guessed one.
+  var publishedModelIdentity: ASRModelIdentity? { get }
 
   // Download progress (0.0–1.0), phase description, and detail string.
   // Updated during loadModel() when model download is in progress.
@@ -145,26 +155,11 @@ public protocol ASRManagerInterface: AnyObject {
   var downloadDetail: String { get }
 
   // Model lifecycle
-  /// #1348 Phase 2: when true, Parakeet loads are delivery-managed cache-only
-  /// (the host admits verified bytes first; the load layer may never
-  /// download). Set by `ParakeetEngineAdapter` from the delivery flag before
-  /// each warm-up. Both conformers honor it on their Parakeet prepare path.
-  var parakeetCacheOnly: Bool { get set }
-  /// #2483: the Parakeet install directory the HOST selected. Set by
-  /// `ParakeetEngineAdapter` alongside `parakeetCacheOnly` before each warm-up.
-  /// Both conformers pass it to their Parakeet prepare path; neither resolves a
-  /// directory of its own, because every default they could reach is
-  /// FluidAudio's shared cache, which EnviousWispr does not own.
-  ///
-  /// **OPTIONAL, and that is the enforcement (#2697).** It was non-optional with
-  /// a default, and the default silently answered an assumed location — so a
-  /// caller that never reached the host's assignment got a working-looking path
-  /// instead of an error, and a REFUSAL by the location seam was indistinguishable
-  /// from a missing manifest. `nil` means nobody has said where the model is, and
-  /// both conformers refuse to load rather than guess. A non-optional URL would
-  /// only have forced initialisation, not prevented initialisation with another
-  /// guess.
-  var parakeetModelDirectory: URL? { get set }
+  // #3546: the Parakeet load request (cache-only mode and install directory)
+  // is no longer two settable members here. It is one package-visible
+  // `ParakeetModelSelection` read from the `ParakeetSelectionProvider` injected
+  // into `ASRManager`; the reasons these two members carried moved with them to
+  // `ASRManager.parakeetSelection`.
   func loadModel() async throws
   func unloadModel() async  // periphery:ignore - called via existential type (ASRManager idle timer)
   func setInitialBackendType(_ type: ASRBackendType)
@@ -174,7 +169,13 @@ public protocol ASRManagerInterface: AnyObject {
   var activeBackendSupportsStreaming: Bool { get async }
 
   // Batch transcription
-  func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult
+  /// #3546 §3.7 T1: passed with THIS call and invoked synchronously by the backend at its
+  /// vendor-call boundary, after readiness, preparatory work and the last cancellation check.
+  /// A refused call never invokes it. `nil` for a caller with no take to attribute.
+  func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver?
+  ) async throws -> ASRResult
 
   /// #2787: whether a vendor decode (`transcribe` / `finalizeStreaming`) is
   /// still running, independent of whether any session is still waiting for
@@ -192,7 +193,13 @@ public protocol ASRManagerInterface: AnyObject {
   /// Create a fresh `attemptID` before scheduling the call and its deadline —
   /// `cancelInFlightStreamingStart(attemptID:)` needs it to name exactly
   /// this attempt (#1908 round 11).
-  func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws
+  /// #3546 §3.7 T1: `onWindowInferenceEntered` is handed to the vendor's streaming manager,
+  /// which calls it synchronously immediately before each window's model call. Observation
+  /// only; it changes no start, stop or cancel decision. `nil` for a caller with no take.
+  func startStreaming(
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver?
+  ) async throws
   func feedAudio(_ buffer: AVAudioPCMBuffer) async throws
   func finalizeStreaming() async throws -> ASRResult
   func cancelStreaming() async
@@ -277,6 +284,12 @@ public protocol ASRManagerInterface: AnyObject {
 }
 
 extension ASRManagerInterface {
+  /// #3546 safe default for test doubles, which publish no delivered model:
+  /// no identity, so telemetry omits the model rather than naming a wrong one.
+  /// `ASRManager` overrides it with its published request.
+  public var publishedModelIdentity: ASRModelIdentity? { nil }
+
+
   /// #1339 safe default: managers do NOT feed the shared progress file unless
   /// they explicitly opt in (`ASRManagerProxy` does).
   public var feedsSharedProgressFile: Bool { false }
@@ -305,16 +318,6 @@ extension ASRManagerInterface {
     public func releaseBatchDecode(trialID: String) async {}
     public func clearBatchDecodeFault() async {}
   #endif
-
-  /// #1348 safe default for test doubles: no delivery mode. BOTH production
-  /// conformers (`ASRManager`, `ASRManagerProxy`) declare real storage, so
-  /// their witnesses win; a mock that ignores writes is semantically correct
-  /// (mocks never download).
-  public var parakeetCacheOnly: Bool {
-    get { false }
-    set {}
-  }
-
 }
 
 /// Thrown when a Parakeet load is asked for before anything has said WHERE the

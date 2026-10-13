@@ -1,6 +1,7 @@
-import Foundation
 import EnviousWisprASR
 import EnviousWisprCore
+import EnviousWisprPipeline
+import Foundation
 
 /// The ONE door for callers that need to load or transcribe on whichever speech
 /// engine is currently active, without knowing which one that is (#1386 PR-2).
@@ -43,7 +44,8 @@ struct ActiveEngineOperation {
     /// command could arrive. A socket-only arm could never reach the replay it
     /// is meant to fault, which would make the whole Live UAT prove nothing.
     /// `EW_FORCE_READINESS_LOST=1` arms it for the first load of that launch.
-    static var forceNextReadinessLost = ProcessInfo.processInfo
+    static var forceNextReadinessLost =
+      ProcessInfo.processInfo
       .environment["EW_FORCE_READINESS_LOST"] == "1"
 
     /// Reads and DISARMS. Named for the consumption because the disarm is the
@@ -65,10 +67,14 @@ struct ActiveEngineOperation {
   /// stronger meaning. `ASREngineNotReadyAfterLoadError` is thrown when the
   /// engine's own readiness projection is false after the loader returns.
   let load: () async throws -> Void
-  /// Batch-transcribe on the active engine.
+  /// Batch-transcribe on the active engine. #3546 §3.7 T1: the inference observation travels
+  /// with this call to the backend's synchronous vendor-call boundary. `nil` for readerless
+  /// recovery replay and benchmark calls.
   let transcribe:
-    (_ audioSamples: [Float], _ options: TranscriptionOptions) async throws ->
-      ASRResult
+    (
+      _ audioSamples: [Float], _ options: TranscriptionOptions,
+      _ onInferenceEntered: ASRInferenceEntryObserver?
+    ) async throws -> ASRResult
   /// #2918: install a 0...1 transcription-progress observer on whichever engine the next
   /// `transcribe` drives (the backend clears it on exit). Defaulted to a no-op so the tests
   /// that build the operation by hand keep their shape; the production wiring routes it
@@ -98,8 +104,12 @@ struct ActiveEngineOperation {
   ///   a seam the test would either race a concurrent unload — timing-dependent,
   ///   which this repo forbids — or substitute a fake loader, which would stop
   ///   testing this factory at all.
+  /// - Parameter parakeetUpgrade: #3546, the Parakeet selection-policy owner.
+  ///   A Parakeet load here first settles a pending selection point through it,
+  ///   so this door never loads the request an earlier selection published.
   static func live(
-    asrManager: any ASRManagerInterface, whisperKitBackend: WhisperKitBackend,
+    asrManager: any ASRManagerInterface, parakeetUpgrade: ParakeetUpgradeCoordinator,
+    whisperKitBackend: WhisperKitBackend,
     afterLoadForTesting: (@MainActor () async -> Void)? = nil
   ) -> ActiveEngineOperation {
     let readiness: @MainActor () async -> Bool = {
@@ -112,7 +122,16 @@ struct ActiveEngineOperation {
         if asrManager.activeBackendType == .whisperKit {
           try await whisperKitBackend.prepare()
         } else {
-          try await asrManager.loadModel()
+          // #3546: every Parakeet load here runs the same load and failure
+          // sequence a warm-up does. A pending selection settles first (A-fail,
+          // E19, bounded repair); a frozen reload keeps the identity already
+          // serving but still takes the bounded repair, so an import, a recovery
+          // replay or a Diagnostics run is not left failing on damaged files.
+          let prepared = try await parakeetUpgrade.prepareLoad()
+          try await parakeetUpgrade.loadPrepared(
+            prepared,
+            checkCaller: { try Task.checkCancellation() },
+            load: { try await asrManager.loadModel() })
         }
         if let afterLoadForTesting { await afterLoadForTesting() }
         // The SAME projection `isLoaded` vends, deliberately: a postcondition
@@ -127,11 +146,13 @@ struct ActiveEngineOperation {
         #endif
         guard ready else { throw ASREngineNotReadyAfterLoadError() }
       },
-      transcribe: { samples, options in
+      transcribe: { samples, options, onInferenceEntered in
         if asrManager.activeBackendType == .whisperKit {
-          return try await whisperKitBackend.transcribe(audioSamples: samples, options: options)
+          return try await whisperKitBackend.transcribe(
+            audioSamples: samples, options: options, onInferenceEntered: onInferenceEntered)
         }
-        return try await asrManager.transcribe(audioSamples: samples, options: options)
+        return try await asrManager.transcribe(
+          audioSamples: samples, options: options, onInferenceEntered: onInferenceEntered)
       },
       hardCancel: {
         // Mirrors load/transcribe's routing. WhisperKit's `unload()` supersedes

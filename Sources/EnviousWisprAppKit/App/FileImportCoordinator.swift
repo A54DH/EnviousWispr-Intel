@@ -44,24 +44,30 @@ final class FileImportCoordinator {
     var titleResource: LocalizedStringResource {
       switch self {
       case .upload:
-        return LocalizedStringResource("Upload", comment: "Transcribe a File: a step name in the step bar.")
+        return LocalizedStringResource(
+          "Upload", comment: "Transcribe a File: a step name in the step bar.")
       case .transcription:
-        return LocalizedStringResource("Transcription", comment: "Transcribe a File: a step name in the step bar.")
+        return LocalizedStringResource(
+          "Transcription", comment: "Transcribe a File: a step name in the step bar.")
       case .polish:
-        return LocalizedStringResource("transcribeFile.step.polish", defaultValue: "Polish",
+        return LocalizedStringResource(
+          "transcribeFile.step.polish", defaultValue: "Polish",
           comment:
             "Transcribe a File: a step name in the step bar. Polish means the AI cleanup of the text (to polish it), never the Polish language."
         )
       case .review:
-        return LocalizedStringResource("Review", comment: "Transcribe a File: a step name in the step bar.")
+        return LocalizedStringResource(
+          "Review", comment: "Transcribe a File: a step name in the step bar.")
       case .working:
-        return LocalizedStringResource("Working", comment: "Transcribe a File: a step name in the step bar.")
+        return LocalizedStringResource(
+          "Working", comment: "Transcribe a File: a step name in the step bar.")
       case .done:
-        return LocalizedStringResource("Done", comment: "Transcribe a File: a step name in the step bar.")
+        return LocalizedStringResource(
+          "Done", comment: "Transcribe a File: a step name in the step bar.")
       }
     }
 
-        var title: String { String(localized: titleResource) }
+    var title: String { String(localized: titleResource) }
   }
 
   private(set) var step: Step = .upload
@@ -382,6 +388,12 @@ final class FileImportCoordinator {
   /// The configuration the CURRENT document was produced under, held until a new
   /// run starts. `nil` before the first run.
   private(set) var runConfiguration: RunConfiguration?
+  /// #3546 §3.7 T1: the receipt of the run that produced the CURRENT document, created at
+  /// the same freeze as `runConfiguration`. The engine records into it synchronously at its
+  /// vendor boundary, through an observer that captured this receipt object itself, so a
+  /// late call from an older run can only write that run's own receipt. Clean it again (no
+  /// transcription) keeps it, as it keeps the engine and model that produced the words.
+  private(set) var runInferenceReceipt = InferenceReceipt<Bool>()
 
   /// The bundled local polisher a RUNNING import has pinned, or nil. Read by the
   /// settings sync so a provider switch defers tearing down the server this run
@@ -459,9 +471,12 @@ final class FileImportCoordinator {
   /// the better source at the only place it existed.
   /// The engine call. The second argument is the run's progress sink (#2918): the engine
   /// reports a 0...1 fraction through it while decoding, and the wiring installs it on the
-  /// engine for this call only.
+  /// engine for this call only. The third is the run's inference observation (#3546), passed
+  /// with the engine call itself.
   private let transcribe:
-    @MainActor ([Float], @escaping @MainActor @Sendable (Double) -> Void) async throws -> ASRResult
+    @MainActor (
+      [Float], @escaping @MainActor @Sendable (Double) -> Void, ASRInferenceEntryObserver?
+    ) async throws -> ASRResult
   /// The dormant, phase-2 speaker step (#2809). Runs after ASR on the same PCM, bounded
   /// and cancellable — see `run(generationAtStart:)`. Defaults to reporting the models as
   /// unavailable rather than silently doing nothing, so a coordinator built without this
@@ -492,7 +507,7 @@ final class FileImportCoordinator {
   /// polisher succeeded. No-op default, same as every other telemetry-shaped closure here.
   private let emitRunTelemetry:
     @MainActor (
-      TelemetryService.FileImportRunOutcome, ASRBackendType, TimeInterval,
+      TelemetryService.FileImportRunOutcome, ASRBackendType, ASRModelAttribution?, TimeInterval,
       TelemetryService.FileImportASROutcome?, TelemetryService.FileImportPolishOutcome?,
       LLMProvider?, String?
     ) -> Void
@@ -538,10 +553,11 @@ final class FileImportCoordinator {
   /// an import holds the engine, so claiming first would make the switch wait
   /// for a run that is itself waiting for the switch.
   private let ensureEngineReady: @MainActor () async -> EngineReadiness
-
-  /// Whether the selected engine still has a model resident. Asked once, after
-  /// the claim, because the unload timer is only disarmed from that point on.
-  private let engineIsLoaded: @MainActor () async -> Bool
+  /// #3546 Chunk 12: whether the selected engine is the active one. Read under the claim,
+  /// before the second readiness drive: a selection changed during the first drive cannot
+  /// converge while this import holds the engine (the engine owner defers that switch until
+  /// the import releases), so waiting for it would hold the claim forever.
+  private let engineSelectionSettled: @MainActor () -> Bool
 
   /// Mirrors `EngineCoordinator.PressReadiness` without importing it, so this
   /// type keeps knowing nothing about who owns engine switching.
@@ -605,6 +621,10 @@ final class FileImportCoordinator {
     /// dictation engine (#2772 §3.2), so a live read here would be right today and wrong the
     /// moment the user changes engines between the raw save and the final update.
     let backendType: ASRBackendType
+    /// #3546 §3.7 T1: the model that engine was serving when this run froze (Start is
+    /// refused unless the engine is ready). Frozen for the same reason as `backendType`;
+    /// nil means unknown, and telemetry then omits the model.
+    var asrModel: ASRModelIdentity? = nil
   }
 
   /// Freezes the configuration this run uses and returns it. Called once per
@@ -765,35 +785,42 @@ final class FileImportCoordinator {
 
   init(
     decode: @escaping @Sendable (URL) async throws -> AudioFileDecoder.Decoded,
-    transcribe: @escaping @MainActor ([Float], @escaping @MainActor @Sendable (Double) -> Void)
+    transcribe:
+      @escaping @MainActor (
+        [Float], @escaping @MainActor @Sendable (Double) -> Void, ASRInferenceEntryObserver?
+      )
       async throws -> ASRResult,
     speakerLabeler: @escaping @MainActor ([Float], TimeInterval) async -> SpeakerAnalysis = {
       _, _ in .failed(.modelsUnavailable)
     },
-    emitSpeakerTelemetry: @escaping @MainActor (
-      SpeakerAnalysis, TimeInterval, Int, ASRWordTimingCoverage?
-    ) -> Void = { _, _, _, _ in },
-    emitTurnTelemetry: @escaping @MainActor (TelemetryService.FileImportTurnsOutcome, Int?, Int) ->
+    emitSpeakerTelemetry:
+      @escaping @MainActor (
+        SpeakerAnalysis, TimeInterval, Int, ASRWordTimingCoverage?
+      ) -> Void = { _, _, _, _ in },
+    emitTurnTelemetry:
+      @escaping @MainActor (TelemetryService.FileImportTurnsOutcome, Int?, Int) ->
       Void = { _, _, _ in },
     emitRenameTelemetry: @escaping @MainActor (TelemetryService.FileImportRenameOutcome) -> Void = {
       _ in
     },
-    emitSpeakerRetryTelemetry: @escaping @MainActor (
-      TelemetryService.FileImportSpeakerRetryOutcome
-    ) -> Void = { _ in },
+    emitSpeakerRetryTelemetry:
+      @escaping @MainActor (
+        TelemetryService.FileImportSpeakerRetryOutcome
+      ) -> Void = { _ in },
     emitTurnsDisplayedTelemetry: @escaping @MainActor () -> Void = {},
-    emitRunTelemetry: @escaping @MainActor (
-      TelemetryService.FileImportRunOutcome, ASRBackendType, TimeInterval,
-      TelemetryService.FileImportASROutcome?, TelemetryService.FileImportPolishOutcome?,
-      LLMProvider?, String?
-    ) -> Void = { _, _, _, _, _, _, _ in },
+    emitRunTelemetry:
+      @escaping @MainActor (
+        TelemetryService.FileImportRunOutcome, ASRBackendType, ASRModelAttribution?, TimeInterval,
+        TelemetryService.FileImportASROutcome?, TelemetryService.FileImportPolishOutcome?,
+        LLMProvider?, String?
+      ) -> Void = { _, _, _, _, _, _, _, _ in },
     captureASRFailure: @escaping @MainActor (any Error, ASRBackendType) -> Void = { _, _ in },
     engineAdmission: EngineAdmissionAccess,
     polishOllamaLocalityNow: @escaping @MainActor () -> Bool? = { false },
     refreshOllamaFacts: @escaping @MainActor () async -> Void = {},
-    engineIsLoaded: @escaping @MainActor () async -> Bool = { true },
     disarmEngineTimers: @escaping @MainActor () -> Void = {},
     rearmEngineTimers: @escaping @MainActor () -> Void = {},
+    engineSelectionSettled: @escaping @MainActor () -> Bool = { true },
     ensureEngineReady: @escaping @MainActor () async -> EngineReadiness = { .ready },
     onEngineReleased: @escaping @MainActor () -> Void = {},
     beginRun: @escaping @MainActor () -> RunConfiguration,
@@ -810,9 +837,10 @@ final class FileImportCoordinator {
     // MAIN import write path — every new import always calls those four; rename and retry
     // are opt-in UI actions most tests never exercise, so a harmless default here does not
     // risk a silently-wrong "saved" answer the way defaulting the core writes would).
-    writeExplicitRename: @escaping @MainActor (
-      UUID, TranscriptSpeakerAnalysis, [Turn]?, (speakerId: String, name: String)
-    ) throws -> Bool = { _, _, _, _ in false },
+    writeExplicitRename:
+      @escaping @MainActor (
+        UUID, TranscriptSpeakerAnalysis, [Turn]?, (speakerId: String, name: String)
+      ) throws -> Bool = { _, _, _, _ in false },
     currentHistoryRow: @escaping @MainActor (UUID) -> Transcript? = { _ in nil },
     historyRowExists: @escaping @MainActor (UUID) -> Bool,
     processPart:
@@ -821,7 +849,7 @@ final class FileImportCoordinator {
     self.polishOllamaLocalityNow = polishOllamaLocalityNow
     self.refreshOllamaFacts = refreshOllamaFacts
     self.ensureEngineReady = ensureEngineReady
-    self.engineIsLoaded = engineIsLoaded
+    self.engineSelectionSettled = engineSelectionSettled
     self.disarmEngineTimers = disarmEngineTimers
     self.rearmEngineTimers = rearmEngineTimers
     self.onEngineReleased = onEngineReleased
@@ -1721,26 +1749,43 @@ final class FileImportCoordinator {
         engineAdmission.release(token)
         finishEngineHold()
       }
-      // The timer above could have fired while we were claiming. Cheap to ask,
-      // and the alternative is transcribing on an engine that just unloaded.
+      // The timer above could have fired while we were claiming, and the
+      // alternative is transcribing on an engine that just unloaded.
+      // #3546 A3: asked unconditionally, not only when the engine reads unloaded.
+      // An in-session Parakeet upgrade that began before this claim can still
+      // read v3 as loaded while it unloads it; the readiness drive waits for that
+      // switch to settle, and returns at once when nothing is in flight.
       //
-      // **Both awaits are suspension points a Stop can land in**, and this one
-      // was added by the previous fix — for WhisperKit, readiness hops to the
-      // backend actor, so the window is real rather than theoretical. Neither
-      // await throws on cancellation, so without the guard a stopped run carried
-      // on and transcribed. Found by cloud review.
-      if await engineIsLoaded() == false {
+      // **This await is a suspension point a Stop can land in.** For WhisperKit,
+      // readiness hops to the backend actor, so the window is real rather than
+      // theoretical. It does not throw on cancellation, so without the guard a
+      // stopped run carried on and transcribed. Found by cloud review.
+      //
+      // A selection the user changed during the first drive is refused, not awaited: its
+      // switch is deferred until this claim is released, so waiting here never ends.
+      guard engineSelectionSettled() else {
         guard generationAtStart == generation else { return }
-        guard await ensureEngineReady() == .ready else {
-          guard generationAtStart == generation else { return }
-          showRejection(.engineNotReady)
-          return
-        }
+        showRejection(.engineNotReady)
+        return
+      }
+      guard await ensureEngineReady() == .ready else {
+        guard generationAtStart == generation else { return }
+        showRejection(.engineNotReady)
+        return
       }
       guard generationAtStart == generation else { return }
+      // And again after it: the user can change engines while the drive waits (for example
+      // during an in-session Ultra activation). The engine owner then stops waiting for a
+      // switch this claim blocks, and the drive may have readied the old engine; freezing now
+      // would record one engine and transcribe on another.
+      guard engineSelectionSettled() else {
+        showRejection(.engineNotReady)
+        return
+      }
 
       let configuration = beginRun()
       runConfiguration = configuration
+      runInferenceReceipt = InferenceReceipt<Bool>()
       transcribingFraction = nil
       // Pinned from the SAME freeze, so the pin cannot outlive or predate it.
       heldLocalPolishProvider = configuration.localPolishProvider
@@ -1835,7 +1880,9 @@ final class FileImportCoordinator {
       polishProvider: selected.polishProvider,
       ollamaModel: selected.ollamaModel,
       polishModel: selected.polishModel,
-      backendType: transcriptionEngine ?? selected.backendType)
+      backendType: transcriptionEngine ?? selected.backendType,
+      // #3546: the engine's model travels with the engine it belongs to.
+      asrModel: transcriptionEngine != nil ? runConfiguration?.asrModel : selected.asrModel)
     runConfiguration = configuration
     // Pinned from the SAME freeze, so the pin cannot outlive or predate it.
     heldLocalPolishProvider = configuration.localPolishProvider
@@ -1901,9 +1948,15 @@ final class FileImportCoordinator {
     guard let file, let configuration = runConfiguration else { return }
     let provider: LLMProvider? =
       configuration.polishProvider == .none ? nil : configuration.polishProvider
+    // #3546 §3.7 T1: whether this run's engine really entered a decode, recorded by the
+    // engine itself and independent of how the transcription ended.
+    let reached = runInferenceReceipt.read() == true
+    let model = configuration.asrModel.map {
+      ASRModelAttribution(identity: $0, loaded: true, inferenceReached: reached)
+    }
     emitRunTelemetry(
-      outcome, configuration.backendType, file.seconds, asrOutcome, polishOutcome, provider,
-      provider == nil ? nil : configuration.polishModel)
+      outcome, configuration.backendType, model, file.seconds, asrOutcome, polishOutcome,
+      provider, provider == nil ? nil : configuration.polishModel)
   }
 
   /// `.skipped` when nothing was ever asked (no provider, or every part was a deliberate
@@ -1924,11 +1977,17 @@ final class FileImportCoordinator {
     // speaker step — which runs after that release — must work from its own array, not the
     // coordinator's variable, or it would receive an empty buffer.
     let analysisSamples = decodedSamples
+    // #3546: this run's own receipt, captured before any await; the engine records into
+    // it synchronously at its vendor boundary.
+    let receipt = runInferenceReceipt
     do {
       transcribingFraction = nil
-      let result = try await transcribe(decodedSamples) { [weak self] fraction in
-        self?.noteTranscribing(fraction: fraction, generationAtStart: generationAtStart)
-      }
+      let result = try await transcribe(
+        decodedSamples,
+        { [weak self] fraction in
+          self?.noteTranscribing(fraction: fraction, generationAtStart: generationAtStart)
+        },
+        { receipt.record(true) })
       // The engine's last word may land below 1 (a trailing window under the padded tail):
       // the transcript is in hand, so the row is done.
       if generationAtStart == generation { transcribingFraction = 1 }

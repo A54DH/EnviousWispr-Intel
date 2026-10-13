@@ -509,6 +509,113 @@ public actor ModelDeliveryController {
     return false
   }
 
+  /// #3546: automatic retirement of an owned install (v3 after Ultra activated,
+  /// or an Ultra target the upgrade policy gave up on). Unlike `remove`, it
+  /// records NO deliberate decline (nobody asked for it); the migration record
+  /// is left as it is, so a completed one keeps the donor from being copied
+  /// again (founder 2026-10-12). It removes EVERY byte in the exact install directory,
+  /// including unlisted or invalid remnants, plus the marker and staging.
+  ///
+  /// Refuses (returns false, deletes nothing) unless the install directory
+  /// resolves strictly inside `ownedModelsRoot`, the marker and staging resolve
+  /// inside the metadata directory, and the install directory neither is nor
+  /// contains the legacy donor. Checked at deletion time. Drains a live attempt
+  /// and a live migration first, as `remove` does. A cancelled caller deletes
+  /// nothing, before or after that drain: its decision may no longer hold.
+  package func retireOwnedInstall(
+    _ registration: DeliveryRegistration, ownedModelsRoot: URL
+  ) async -> Bool {
+    let identity = registration.manifest.identity
+    guard !Task.isCancelled else { return false }
+    await drainForDeletion(identity)
+    guard !Task.isCancelled else { return false }
+    let admission = admission(for: registration)
+    let staging = stagingDirectory(for: registration)
+    let install = registration.installDirectory
+    let fm = FileManager.default
+    guard
+      Self.ownedStrictly(install, by: ownedModelsRoot),
+      PathSafety.resolvedPath(registration.metadataDirectory) != nil,
+      PathSafety.resolvesInside(admission.markerURL, root: registration.metadataDirectory),
+      PathSafety.resolvesInside(staging, root: registration.metadataDirectory),
+      Self.installLocationIsSafe(registration),
+      registration.legacyDonorDirectory.map({
+        !PathSafety.resolvesInside($0, root: install)
+      }) ?? true
+    else {
+      await AppLogger.shared.log(
+        "Model delivery refused to retire \(identity.cacheKey): location not owned",
+        level: .info, category: "Delivery")
+      return false
+    }
+    do {
+      // Remove, then treat only "no such file" as already gone: an existence
+      // probe first would read a failed lookup as absence and skip a dangling
+      // link, and the retirement would report success over residue.
+      for url in [admission.markerURL, install, staging] {
+        do {
+          try fm.removeItem(at: url)
+        } catch {
+          let ns = error as NSError
+          guard ns.domain == NSCocoaErrorDomain,
+            ns.code == NSFileNoSuchFileError || ns.code == NSFileReadNoSuchFileError
+          else { throw error }
+        }
+      }
+    } catch {
+      await AppLogger.shared.log(
+        "Model delivery could not retire \(identity.cacheKey): \(error.localizedDescription)",
+        level: .info, category: "Delivery")
+      return false
+    }
+    setState(identity, .notReady)
+    await AppLogger.shared.log(
+      "Model delivery retired \(identity.cacheKey)", level: .info, category: "Delivery")
+    return true
+  }
+
+  /// Positive containment for automatic deletion (#3546): the owned root must
+  /// EXIST and resolve, and the install directory (or, when absent, its parent)
+  /// must resolve strictly inside it. Unlike `PathSafety.resolvesInside`, a
+  /// root that does not exist yet is not answered by its nearest ancestor:
+  /// nothing gets deleted against a root that is not really there.
+  /// Only a real absence counts as absent: an install that cannot be looked
+  /// up, or that exists but does not resolve, refuses.
+  nonisolated static func ownedStrictly(_ install: URL, by ownedRoot: URL) -> Bool {
+    guard let rootPath = PathSafety.resolvedPath(ownedRoot) else { return false }
+    switch PathSafety.reachability(of: install) {
+    case nil:
+      guard let installPath = PathSafety.resolvedPath(install) else { return false }
+      return installPath != rootPath && PathSafety.contained(installPath, in: rootPath)
+    case .absent?:
+      guard let parentPath = PathSafety.resolvedPath(install.deletingLastPathComponent())
+      else { return false }
+      return parentPath == rootPath || PathSafety.contained(parentPath, in: rootPath)
+    case .unreadable?, .indeterminate?:
+      return false
+    }
+  }
+
+  /// Test seam (internal): awaited inside the deletion drain, so a test can act
+  /// while a deletion is held there.
+  private var retirementDrainGateForTesting: (@Sendable () async -> Void)?
+
+  func setRetirementDrainGateForTesting(_ gate: (@Sendable () async -> Void)?) {
+    retirementDrainGateForTesting = gate
+  }
+
+  /// The drain both deleters share: a live attempt (the cancel drain barrier; a
+  /// nothing-in-flight cancel is a no-op), then a live migration.
+  private func drainForDeletion(_ identity: ModelIdentity) async {
+    _ = await cancel(identity)
+    if let retirementDrainGateForTesting { await retirementDrainGateForTesting() }
+    if let live = migrationsInFlight[identity] {
+      live.cancel()
+      _ = await live.value
+      migrationsInFlight[identity] = nil
+    }
+  }
+
   public func remove(_ registration: DeliveryRegistration) async -> RemoveOutcome {
     let identity = registration.manifest.identity
     // Drain any live attempt first (reuses the cancel drain barrier); a

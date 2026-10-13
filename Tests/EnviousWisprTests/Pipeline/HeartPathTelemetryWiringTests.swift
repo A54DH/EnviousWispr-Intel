@@ -106,6 +106,7 @@ struct HeartPathTelemetryWiringTests {
       inputs: .init(
         audioCapture: audio,
         asrManager: makeASR(),
+        parakeetUpgrade: .legacyForTesting(),
         vadSignalSource: vad,
         transcriptStore: TranscriptStore(),
         keychainManager: KeychainManager(),
@@ -220,6 +221,7 @@ struct HeartPathTelemetryWiringTests {
       inputs: .init(
         audioCapture: audioCapture,
         asrManager: asrManager,
+        parakeetUpgrade: .legacyForTesting(),
         vadSignalSource: vad,
         transcriptStore: TranscriptStore(),
         keychainManager: KeychainManager(),
@@ -297,6 +299,7 @@ struct HeartPathTelemetryWiringTests {
         inputs: .init(
           audioCapture: audioCapture,
           asrManager: asrManager,
+          parakeetUpgrade: .legacyForTesting(),
           vadSignalSource: vad,
           transcriptStore: TranscriptStore(),
           keychainManager: KeychainManager(),
@@ -476,6 +479,7 @@ struct HeartPathTelemetryWiringTests {
               ASRResult(
                 text: "hello", language: "en", duration: 1,
                 processingTime: 0.01, backendType: .parakeet))),
+          parakeetUpgrade: .legacyForTesting(),
           vadSignalSource: KernelDictationDriverFactory.makeSharedVADSignalSource(
             audioCapture: audioCapture),
           transcriptStore: TranscriptStore(),
@@ -615,11 +619,6 @@ private final class NoOpAudioCapture: AudioCaptureInterface {
 /// trivial values so any unintended invocation surfaces immediately.
 @MainActor
 private final class NoOpASRManager: ASRManagerInterface {
-  /// #2697: real storage, because the protocol no longer carries a default.
-  /// The default answered an assumed install directory, so a double that never
-  /// set one still reported a usable path. `nil` means nobody has said where the
-  /// model is, which is what a double that loads nothing should say.
-  var parakeetModelDirectory: URL?
   var activeBackendType: ASRBackendType = .parakeet
   var isModelLoaded: Bool = false
   let vendorDecodeOccupancy = VendorDecodeOccupancy()
@@ -639,10 +638,16 @@ private final class NoOpASRManager: ASRManagerInterface {
 
   var activeBackendSupportsStreaming: Bool { get async { false } }
 
-  func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult {
+  func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws -> ASRResult {
     throw NoOpError.unexpected
   }
-  func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws {
+  func startStreaming(
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws {
     throw NoOpError.unexpected
   }
   func feedAudio(_ buffer: AVAudioPCMBuffer) async throws { throw NoOpError.unexpected }

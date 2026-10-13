@@ -1017,7 +1017,8 @@ struct MenuBarControllerTests {
     spy: ActionSpy = ActionSpy(), settings: SettingsManager = SettingsManager(),
     connectedMicrophones: Set<String> = []
   ) -> MenuBarController {
-    let asrManager = ASRManager(engineMutationScope: .alwaysAllowedForTesting)
+    let asrManager = ASRManager(
+      engineMutationScope: .alwaysAllowedForTesting, parakeetSelection: ParakeetSelectionProvider())
     // Shared lightweight audio fake from DictationRuntimeTestSupport (same
     // test target). MenuBarController never reads `audioLevel` in these tests
     // (the icon animator's level closure is only wired by `installStatusItem`,
@@ -1036,7 +1037,8 @@ struct MenuBarControllerTests {
     let backendMetadata = BackendMetadata(
       settings: settings,
       llmDiscovery: LLMModelDiscoveryCoordinator(keychainManager: KeychainManager()),
-      activeModelLoaded: { [weak asrManager] in asrManager?.isModelLoaded ?? false })
+      activeModelLoaded: { [weak asrManager] in asrManager?.isModelLoaded ?? false },
+      parakeetModelLabel: { "Parakeet v3" })
     // Nil-fake updater factory — no real Sparkle boot in the test process.
     let sparkle = SparkleUpdateController(
       holder: UpdateCoordinatorHolder(),

@@ -105,6 +105,7 @@ struct HeartPathIntegrationTests {
       inputs: .init(
         audioCapture: audioCapture,
         asrManager: asrManager,
+        parakeetUpgrade: .legacyForTesting(),
         vadSignalSource: vad,
         transcriptStore: TranscriptStore(),
         keychainManager: KeychainManager(),
@@ -320,7 +321,8 @@ private final class HeartPathHarness {
     // language, duration and processing time come from the same result the
     // test asserts. Transcribing separately and handing the wiring a different
     // adapter silently disconnects that metadata.
-    let adapter = ParakeetEngineAdapter(asrManager: asrManager)
+    let adapter = ParakeetEngineAdapter(
+      asrManager: asrManager, parakeetUpgrade: .legacyForTesting())
     try await adapter.beginSession(SessionID(), options: .default, streaming: false)
     let asrResult: ASRResult
     switch await adapter.finalize(batchSamples: captureResult.samples) {
@@ -676,11 +678,6 @@ internal final class FixtureAudioCapture: AudioCaptureInterface {
 
 @MainActor
 internal final class MockASRManager: ASRManagerInterface {
-  /// #2697: real storage, because the protocol no longer carries a default.
-  /// The default answered an assumed install directory, so a double that never
-  /// set one still reported a usable path. `nil` means nobody has said where the
-  /// model is, which is what a double that loads nothing should say.
-  var parakeetModelDirectory: URL?
   enum TranscribeBehavior {
     case success(ASRResult)
     case failure(Error)
@@ -716,8 +713,8 @@ internal final class MockASRManager: ASRManagerInterface {
   }
 
   func transcribe(
-    audioSamples: [Float],
-    options: TranscriptionOptions
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver? = nil
   ) async throws -> ASRResult {
     transcribeCallCount += 1
     lastTranscribedSampleCount = audioSamples.count
@@ -730,7 +727,10 @@ internal final class MockASRManager: ASRManagerInterface {
     }
   }
 
-  func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws {
+  func startStreaming(
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws {
     throw MockFailure.unexpectedStreaming
   }
 

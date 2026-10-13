@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import EnviousWisprCore
+import EnviousWisprServices
 import Foundation
 
 /// Manages ASR backend selection and delegates transcription calls.
@@ -7,7 +8,43 @@ import Foundation
 @Observable
 public final class ASRManager: ASRManagerInterface {
   public private(set) var activeBackendType: ASRBackendType = .parakeet
-  public private(set) var isModelLoaded = false
+  public private(set) var isModelLoaded = false {
+    // #3546 §3.7: a model that is no longer loaded no longer serves.
+    didSet { if !isModelLoaded { publishedSelection = nil } }
+  }
+  /// #3546 §3.7 T1: the Parakeet request the current READY model was loaded
+  /// from, set at the same publish that reports `didPublishLoad`. `nil` while
+  /// nothing is loaded, after an unload or backend switch, and for a backend
+  /// that loads without a request (an injected mock).
+  package private(set) var publishedSelection: ParakeetModelSelection? {
+    // #3546 §3.7 T3: publish, failed publish, unload and switch all pass through here.
+    didSet { if publishedSelection != oldValue { reportModelScope() } }
+  }
+
+  /// #3546 §3.7 T3: Parakeet's crash-report model tags, owned by `ASRModelScopeOwner`.
+  /// `scopeRequested` and `scopePhase` describe the latest physical load; the serving
+  /// model is always `publishedModelIdentity`.
+  package var modelScopeOwner: ASRModelScopeOwner = .shared
+  private var scopeSequence: UInt64 = 0
+  private var scopeRequested: ASRModelIdentity?
+  private var scopePhase: ASRModelScopeOwner.Phase?
+
+  private func reportModelScope() {
+    scopeSequence &+= 1
+    modelScopeOwner.observe(
+      .parakeet, sequence: scopeSequence,
+      snapshot: .init(requested: scopeRequested, phase: scopePhase, serving: publishedModelIdentity)
+    )
+  }
+
+  /// A cancelled, superseded or user-cancelled load is `cancelled`; anything else failed.
+  static func scopePhase(after error: any Error) -> ASRModelScopeOwner.Phase {
+    error is CancellationError || error is ASRLoadCancelledError
+      || error is ASRLoadSupersededError ? .cancelled : .failed
+  }
+
+  public var publishedModelIdentity: ASRModelIdentity? { publishedSelection?.modelIdentity }
+
   public private(set) var isStreaming = false
 
   // Download progress — updated in-process during loadModel().
@@ -28,14 +65,41 @@ public final class ASRManager: ASRManagerInterface {
   /// trip already uses — never a fixed cadence (#1908: forwarding a timer
   /// tick here would manufacture progress the kernel counts as real).
   public var loadProgressTickReporter: (@MainActor @Sendable (Date?, String) -> Void)?
-  /// #1348 Phase 2: delivery-managed Parakeet loads are cache-only (see
-  /// `ASRManagerInterface.parakeetCacheOnly`).
-  public var parakeetCacheOnly = false
+  /// #3546: the Parakeet load request, one snapshot per physical load. It
+  /// replaced the two settable members below (reasons kept verbatim):
+  ///
+  /// `parakeetCacheOnly`, from `ASRManagerInterface`:
+  /// #1348 Phase 2: when true, Parakeet loads are delivery-managed cache-only
+  /// (the host admits verified bytes first; the load layer may never
+  /// download). Set by `ParakeetEngineAdapter` from the delivery flag before
+  /// each warm-up. Both conformers honor it on their Parakeet prepare path.
+  ///
+  /// `parakeetModelDirectory`, from `ASRManagerInterface`:
+  /// #2483: the Parakeet install directory the HOST selected. Set by
+  /// `ParakeetEngineAdapter` alongside `parakeetCacheOnly` before each warm-up.
+  /// Both conformers pass it to their Parakeet prepare path; neither resolves a
+  /// directory of its own, because every default they could reach is
+  /// FluidAudio's shared cache, which EnviousWispr does not own.
+  ///
+  /// **OPTIONAL, and that is the enforcement (#2697).** It was non-optional with
+  /// a default, and the default silently answered an assumed location — so a
+  /// caller that never reached the host's assignment got a working-looking path
+  /// instead of an error, and a REFUSAL by the location seam was indistinguishable
+  /// from a missing manifest. `nil` means nobody has said where the model is, and
+  /// both conformers refuse to load rather than guess. A non-optional URL would
+  /// only have forced initialisation, not prevented initialisation with another
+  /// guess.
+  ///
+  /// `parakeetModelDirectory`, from this class:
   /// #2483: see `ASRManagerProxy.parakeetModelDirectory`. The default is OUR
   /// directory, never the vendor's, so an entry point that loads without going
   /// through `ParakeetEngineAdapter` — `ActiveEngineOperation.load` does exactly
   /// that — cannot reach FluidAudio's shared tree by omission.
-  public var parakeetModelDirectory: URL?
+  ///
+  /// The provider is the same instance the adapter writes, so that entry point
+  /// reads the same request the adapter's warm-up chose. `package`, not
+  /// `public`, for the same reason as `engineMutationScope`.
+  package let parakeetSelection: ParakeetSelectionProvider
   /// #1908: this manager's `loadModel()` progress also lands in the shared
   /// file, matching `ASRManagerProxy`'s existing opt-in — the sessionless
   /// warm-up wedge guard depends on it regardless of transport.
@@ -111,6 +175,11 @@ public final class ASRManager: ASRManagerInterface {
   /// supersession early-return. Ordinary session discard never calls this.
   private func invalidateCurrentLoadGeneration(cause: String) {
     loadGeneration &+= 1
+    // #3546 §3.7 T3: the load in flight no longer counts.
+    if scopePhase == .loading {
+      scopePhase = .cancelled
+      reportModelScope()
+    }
     if isModelLoaded {
       Task {
         await AppLogger.shared.log(
@@ -152,7 +221,9 @@ public final class ASRManager: ASRManagerInterface {
   private var offlineModeAdmittedValue: Bool?
   private var offlineModeAdmissionCount = 0
 
-  private func admitOfflineMode(cacheOnly: Bool) throws {
+  /// `internal`, not `private`, only so a test can hold a conflicting mode
+  /// (#3546: a refused attempt must spend no Ultra load attempt).
+  func admitOfflineMode(cacheOnly: Bool) throws {
     if let admitted = offlineModeAdmittedValue {
       guard admitted == cacheOnly else {
         throw ParakeetOfflineModeConflictError()
@@ -164,7 +235,7 @@ public final class ASRManager: ASRManagerInterface {
     offlineModeAdmissionCount = 1
   }
 
-  private func releaseOfflineModeAdmission() {
+  func releaseOfflineModeAdmission() {
     guard offlineModeAdmissionCount > 0 else { return }
     offlineModeAdmissionCount -= 1
     if offlineModeAdmissionCount == 0 {
@@ -174,9 +245,11 @@ public final class ASRManager: ASRManagerInterface {
 
   package init(
     engineMutationScope: EngineMutationScope,
+    parakeetSelection: ParakeetSelectionProvider,
     parakeetBackendFactory: @escaping () -> any ASRBackend = { ParakeetBackend() }
   ) {
     self.engineMutationScope = engineMutationScope
+    self.parakeetSelection = parakeetSelection
     self.parakeetBackendFactory = parakeetBackendFactory
     self.parakeetBackend = parakeetBackendFactory()
   }
@@ -369,18 +442,29 @@ public final class ASRManager: ASRManagerInterface {
     // succeeds, so an abandoned attempt can never mutate the instance a
     // successor or any other caller is using.
     let candidate = parakeetBackendFactory()
-    var published = false
-    defer {
+    do {
+      try await prepareAndPublish(candidate, generation: gen)
+    } catch {
       // Any exit that never published `candidate` — superseded, cancelled,
       // or a thrown error — must still release whatever resources its own
       // `prepare()` may have allocated. Dropping the reference alone does
       // NOT run FluidAudio's `cleanup()` (no `deinit` performs it), so this
       // is the ONLY thing that frees a superseded attempt's real resources.
-      if !published {
-        Task { await candidate.unload() }
-      }
+      // `prepareAndPublish` publishes only on its success path, so every
+      // throw is unpublished.
+      // #3546: awaited, not detached, so the caller's fallback (a failed Ultra load
+      // falling back to v3) cannot start while this candidate still holds a model. This
+      // runs in `performLoadRacingCancellation`'s own task, so a cancelled caller is
+      // already released and does not wait here.
+      await candidate.unload()
+      throw error
     }
+  }
 
+  /// The body of one physical load: prepares `candidate` and publishes it only on success.
+  private func prepareAndPublish(_ candidate: any ASRBackend, generation gen: UInt64)
+    async throws
+  {
     let progress: ProgressCallback = { [weak self] fraction, phase, detail in
       Task { @MainActor [weak self] in
         guard let self, gen == self.loadGeneration, !self.isModelLoaded else { return }
@@ -411,21 +495,48 @@ public final class ASRManager: ASRManagerInterface {
     // hole because the proxy passes the directory on every load. Only a
     // non-`ParakeetBackend` backend (an injected mock, which loads nothing)
     // takes the protocol overload now.
+    // (#3546: `parakeetCacheOnly` is now the request's `cacheOnly`.)
+    var loadedSelection: ParakeetModelSelection?
     if let parakeet = candidate as? ParakeetBackend {
       // #2697: refuse rather than resolve one of our own. `nil` means the
       // location seam either has not run or REFUSED, and both must fail
       // loudly here instead of loading from an assumed directory.
-      guard let directory = parakeetModelDirectory else {
+      // #3546: ONE snapshot. Mode and directory below both come from it, so
+      // they cannot disagree.
+      guard let selection = parakeetSelection.current else {
         throw ParakeetModelDirectoryUnsetError()
       }
       // #1908: process-global offline-mode exclusion — see the property docs
       // above. Refuses a conflicting-mode attempt BEFORE `prepare()` ever
       // reaches FluidAudio's shared static; a same-mode attempt proceeds.
-      try admitOfflineMode(cacheOnly: parakeetCacheOnly)
+      try admitOfflineMode(cacheOnly: selection.cacheOnly)
       defer { releaseOfflineModeAdmission() }
-      try await parakeet.prepare(
-        cacheOnly: parakeetCacheOnly, modelDirectory: directory,
-        progressCallback: progress)
+      // #3546: one count per PHYSICAL load (joined callers never get here),
+      // after admission and immediately before the vendor boundary, so a
+      // refused attempt spends nothing and a crash inside the loader still
+      // leaves the attempt spent. A persistence failure releases admission
+      // through the defer and enters no vendor code. An Ultra request with
+      // nothing to count it fails closed.
+      if let beforePhysicalLoad = parakeetSelection.beforePhysicalLoad {
+        try beforePhysicalLoad(selection)
+      } else if selection.model != .v3 {
+        throw ParakeetLoadAccountingUnavailableError()
+      }
+      loadedSelection = selection
+      // #3546 §3.7 T3: tagged after admission and accounting, before the vendor load.
+      scopeRequested = selection.modelIdentity
+      scopePhase = .loading
+      reportModelScope()
+      do {
+        try await parakeet.prepare(selection: selection, progressCallback: progress)
+      } catch {
+        // A superseded load's phase belongs to the load that replaced it.
+        if gen == loadGeneration {
+          scopePhase = Self.scopePhase(after: error)
+          reportModelScope()
+        }
+        throw error
+      }
     } else {
       try await candidate.prepare(progressCallback: progress)
     }
@@ -445,10 +556,19 @@ public final class ASRManager: ASRManagerInterface {
     // ARC deallocation alone does not run.
     let retiring = parakeetBackend
     parakeetBackend = candidate
-    published = true
     isModelLoaded = ready
     if !(retiring === (candidate as AnyObject)) {
       Task { await retiring.unload() }
+    }
+    // #3546: only a READY publish for the current generation (the superseded
+    // case threw above) reports success, whoever asked for the load.
+    publishedSelection = ready ? loadedSelection : nil
+    if loadedSelection != nil {
+      scopePhase = ready ? .loaded : .failed
+      reportModelScope()
+    }
+    if ready, let loadedSelection {
+      parakeetSelection.didPublishLoad?(loadedSelection)
     }
   }
 
@@ -460,9 +580,11 @@ public final class ASRManager: ASRManagerInterface {
   // still makes a press landing during a launch warm-up join the in-flight load.
 
   /// Transcribe raw audio samples (16kHz mono Float32).
-  public func transcribe(audioSamples: [Float], options: TranscriptionOptions = .default)
-    async throws -> ASRResult
-  {
+  /// #3546: `onInferenceEntered` per the protocol docs.
+  public func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions = .default,
+    onInferenceEntered inferenceObserver: ASRInferenceEntryObserver? = nil
+  ) async throws -> ASRResult {
     guard let activeBackend else { throw ASRManagerNotOwnedError(backend: activeBackendType) }
     // #2787: counted for the whole vendor call, so a session that stops
     // waiting (cancel during transcribing) leaves the engine visibly BUSY
@@ -492,7 +614,9 @@ public final class ASRManager: ASRManagerInterface {
       await activeBackend.setTranscriptionProgressObserver(sink)
       do {
         try Task.checkCancellation()
-        return try await activeBackend.transcribe(audioSamples: audioSamples, options: options)
+        // #3546: passed through; the backend commits it at its own vendor boundary.
+        return try await activeBackend.transcribe(
+          audioSamples: audioSamples, options: options, onInferenceEntered: inferenceObserver)
       } catch {
         await activeBackend.setTranscriptionProgressObserver(nil)
         throw error
@@ -516,7 +640,8 @@ public final class ASRManager: ASRManagerInterface {
   /// counter) so `cancelInFlightStreamingStart(attemptID:)` can name exactly
   /// which attempt it means to abandon, never an unrelated later one.
   public func startStreaming(
-    options: TranscriptionOptions = .default, attemptID: UUID = UUID()
+    options: TranscriptionOptions = .default, attemptID: UUID = UUID(),
+    onWindowInferenceEntered: ASRInferenceEntryObserver? = nil
   ) async throws {
     try Task.checkCancellation()
     guard !streamingStartInFlight, !isStreaming else { throw CancellationError() }
@@ -557,7 +682,9 @@ public final class ASRManager: ASRManagerInterface {
     guard supported else { return }
 
     if let parakeet, let backendGen {
-      try await parakeet.startStreaming(options: options, generation: backendGen)
+      try await parakeet.startStreaming(
+        options: options, generation: backendGen,
+        onWindowInferenceEntered: onWindowInferenceEntered)
     } else {
       // Non-Parakeet (or an injected test backend): no backend-level
       // generation to coordinate, same as before #1908 round 8.
@@ -686,6 +813,22 @@ public final class ASRManager: ASRManagerInterface {
   /// Unload the active backend, freeing model RAM.
   /// Refuses to unload if a streaming session is active — cancel streaming first.
   public func unloadModel() async {
+    // #3546 A3: one unload at a time. A second caller (the in-session Ultra activation, while
+    // an idle unload is already running) waits for the running one instead of starting its
+    // own, so it never returns while the first is still releasing the model.
+    if let running = inFlightUnloadTask {
+      await running.value
+      return
+    }
+    let task = Task { @MainActor in await self.unloadModelOnce() }
+    inFlightUnloadTask = task
+    defer { inFlightUnloadTask = nil }
+    await task.value
+  }
+
+  private var inFlightUnloadTask: Task<Void, Never>?
+
+  private func unloadModelOnce() async {
     // #959: a live streaming session means the model is in use and there is no
     // in-flight load to supersede — refuse FIRST, before bumping the generation,
     // so the readiness `ready→notReady` log never falsely fires on a refusal
@@ -778,16 +921,41 @@ public final class ASRManager: ASRManagerInterface {
   public func noteTranscriptionComplete(policy: ModelUnloadPolicy) {
     lastTranscriptionTime = Date()
     if policy == .immediately {
-      Task { await unloadModel() }
+      cancelIdleTimer()
+      enqueueIdleUnload()
       return
     }
     scheduleIdleTimer(policy: policy)
   }
 
-  /// Cancel any pending idle timer (called when recording starts).
+  /// Cancel any pending idle timer (called when recording starts), and any idle unload
+  /// already queued but not yet started. An unload already running is not stopped.
   public func cancelIdleTimer() {
     idleTimer?.invalidate()
     idleTimer = nil
+    idleUnloadGeneration &+= 1
+  }
+
+  /// Bumped by `cancelIdleTimer()`. #3546 A3: the Timer callback and the `.immediately`
+  /// policy each queue an unload task; invalidating the Timer does not reach a task it
+  /// already queued, which would then unload the model an in-session activation is loading.
+  private var idleUnloadGeneration: UInt64 = 0
+
+  private var queuedIdleUnloadTask: Task<Void, Never>?
+
+  private func enqueueIdleUnload() {
+    let generation = idleUnloadGeneration
+    queuedIdleUnloadTask = Task { @MainActor [weak self] in
+      guard let self, generation == self.idleUnloadGeneration else { return }
+      await self.unloadModel()
+    }
+  }
+
+  /// The last queued idle unload, run or dropped, so a test waits for the subject itself. Not
+  /// DEBUG-only: the Release test build (CI's build-for-testing) compiles the test that calls it.
+  // periphery:ignore - test seam
+  func waitForQueuedIdleUnloadForTesting() async {
+    await queuedIdleUnloadTask?.value
   }
 
   /// Schedule (or reset) the idle timer for timed policies.
@@ -797,7 +965,7 @@ public final class ASRManager: ASRManagerInterface {
     // Timer fires on the main run loop — safe for @MainActor ASRManager.
     idleTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
       MainActor.assumeIsolated {
-        _ = Task<Void, Never> { await self?.unloadModel() }
+        self?.enqueueIdleUnload()
       }
     }
   }

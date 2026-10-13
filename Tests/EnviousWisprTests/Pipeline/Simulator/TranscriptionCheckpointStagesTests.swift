@@ -34,14 +34,14 @@ struct TranscriptionCheckpointStagesTests {
   /// The running chunk count carried by each `decodeChunkScheduled` mark, in order.
   private func scheduledChunkCounts(_ wrapper: KernelRecordingSession) -> [Int] {
     wrapper.transcriptionCheckpointEvents.compactMap { event -> Int? in
-      if case .mark(_, _, .decodeChunkScheduled, let count) = event { return count }
+      if case .mark(_, _, .decodeChunkScheduled, let count, _) = event { return count }
       return nil
     }
   }
 
   private func stages(_ events: [TranscriptionCheckpointEvent]) -> [TranscriptionStage] {
     events.compactMap {
-      if case .mark(_, _, let stage, _) = $0 { return stage }
+      if case .mark(_, _, let stage, _, _) = $0 { return stage }
       return nil
     }
   }
@@ -69,7 +69,7 @@ struct TranscriptionCheckpointStagesTests {
     #expect(events.last == .clear, "the terminal must clear the checkpoint")
     // Every mark names the take and the engine, never text.
     for event in events {
-      if case .mark(let takeID, let backend, _, let chunks) = event {
+      if case .mark(let takeID, let backend, _, let chunks, _) = event {
         #expect(UUID(uuidString: takeID) != nil, "take id must be the session UUID")
         #expect(backend == "parakeet")
         #expect(chunks == 0, "no vendor chunk progress is wired in this revision")
@@ -129,7 +129,7 @@ struct TranscriptionCheckpointStagesTests {
     #expect(result.passed, "\(result.failures)")
     let events = wrapper.transcriptionCheckpointEvents
     let chunkMarks = events.compactMap { event -> Int? in
-      if case .mark(_, _, .decodeChunkScheduled, let chunks) = event { return chunks }
+      if case .mark(_, _, .decodeChunkScheduled, let chunks, _) = event { return chunks }
       return nil
     }
     #expect(chunkMarks == [1, 2], "each observation tick carries the running chunk count")
@@ -242,6 +242,7 @@ struct TranscriptionCheckpointStagesTests {
     #expect(wrapper.effects.resourcesReleased, "the late stop return did run")
     #expect(
       wrapper.transcriptionCheckpointEvents == terminalEvents,
-      "a mark after the clear would be a false report next launch: \(wrapper.transcriptionCheckpointEvents)")
+      "a mark after the clear would be a false report next launch: \(wrapper.transcriptionCheckpointEvents)"
+    )
   }
 }

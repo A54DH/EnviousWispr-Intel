@@ -14,13 +14,126 @@ import Foundation
 /// direction; the composition root holds it as one `let`.
 @Observable @MainActor
 final class ModelDeliveryHome {
-  let controller = ModelDeliveryController()
+  let controller: ModelDeliveryController = {
+    #if DEBUG
+      // #3546 T4: a DEBUG-only Live UAT seam. It reports a fixed free-disk figure to
+      // every delivery preflight, so the deferred-disk upgrade outcome is staged
+      // without filling a real disk. It is logged when used; Release compiles it out.
+      if let raw = ProcessInfo.processInfo.environment["EW_UAT_DELIVERY_AVAILABLE_BYTES"],
+        let bytes = Int64(raw)
+      {
+        Task {
+          await AppLogger.shared.log(
+            "UAT seam: available disk forced to \(bytes) bytes",
+            level: .info, category: "Delivery")
+        }
+        return ModelDeliveryController(availableDiskBytes: { _ in bytes })
+      }
+    #endif
+    return ModelDeliveryController()
+  }()
   /// Nil when the bundled manifest failed to load — a can't-happen-in-release
   /// condition (unit-tested against the bundled resource); the Parakeet path
   /// then runs legacy delivery, never crashes.
   private(set) var parakeetHandle: ParakeetDeliveryHandle?
   private var parakeetIdentity: ModelIdentity?
   private var parakeetRegistration: DeliveryRegistration?
+  /// #3546: the retired v3 manifest's handle. It never fetches; it accepts an
+  /// existing v3 install (fast path, validation, read-only donor migration) so
+  /// v3 keeps serving until Ultra activates. Nil when the shipped (Ultra)
+  /// manifest or the retired one is unavailable: a missing retired manifest
+  /// means no v3 acceptance, never an invented one.
+  private(set) var parakeetRetiredV3Handle: ParakeetDeliveryHandle?
+  private var parakeetRetiredV3Registration: DeliveryRegistration?
+  /// #3546: the Ultra target the upgrade coordinator is built with.
+  private var parakeetUpgradeTarget: ParakeetUpgradeCoordinator.UpgradeTarget?
+  /// #3546 test observations (internal): the launch donor migration's task and
+  /// the Parakeet observer setup, so a test can wait for what construction
+  /// started without starting either itself. Production never reads them.
+  private(set) var retiredV3LaunchMigrationForTesting: Task<URL?, Never>?
+
+  /// #3546: what Settings presents for Parakeet, mirrored from the upgrade
+  /// coordinator (it owns every decision; this only re-reads on its signal).
+  private(set) var parakeetPresentedModel: ParakeetModel?
+  private(set) var parakeetBackgroundUpgrade: ParakeetUpgradeCoordinator.BackgroundUpgradeState =
+    .idle
+  private(set) var parakeetNeedsExplicitRetry = false
+  /// v3 failed to load in this launch (E19): its name may still show, but the
+  /// download row belongs to the serving Ultra.
+  private(set) var parakeetV3Rejected = false
+  /// Bumped on every coordinator presentation signal, so Settings re-reads
+  /// "Model ready" when the policy changed but no mirrored value did.
+  private(set) var parakeetPresentationRevision: UInt64 = 0
+  /// Before any selection: accepted v3 when the retired v3 is admitted on disk,
+  /// otherwise the new Ultra default. Read once at construction.
+  private(set) var parakeetFallbackModel: ParakeetModel = .ultra
+
+  /// The verbatim model name Settings, the sidebar and Transcribe a File show.
+  /// Without an upgrade target (the shipped manifest is unavailable) the
+  /// no-handle route serves v3, so it is named. A name never implies the
+  /// model is loaded.
+  var parakeetModelLabel: String {
+    guard parakeetUpgrade?.hasUpgradeTarget == true else { return ParakeetModel.v3.displayName }
+    return (parakeetPresentedModel ?? parakeetFallbackModel).displayName
+  }
+
+  /// Whether the background upgrade, not the serving model, owns the Settings
+  /// download row: a target exists and the presented (or fallback) model is an
+  /// unrejected v3, so dictation works while Ultra downloads, pauses or waits.
+  var parakeetRowIsBackgroundUpgrade: Bool {
+    parakeetUpgrade?.hasUpgradeTarget == true
+      && !parakeetV3Rejected
+      && (parakeetPresentedModel ?? parakeetFallbackModel) == .v3
+  }
+
+  private func refreshParakeetPresentation() {
+    guard let parakeetUpgrade else { return }
+    parakeetPresentedModel = parakeetUpgrade.presentedModel
+    parakeetBackgroundUpgrade = parakeetUpgrade.backgroundUpgrade
+    parakeetNeedsExplicitRetry = parakeetUpgrade.needsExplicitRetry
+    parakeetV3Rejected = parakeetUpgrade.v3RejectedForPresentation
+    parakeetPresentationRevision &+= 1
+  }
+  private(set) var parakeetObserverSetupForTesting: Task<Void, Never>?
+
+  func firstRunForTesting(_ identity: ModelIdentity) -> Bool? {
+    firstRunByIdentity[identity]
+  }
+  /// #3546: the Parakeet selection-policy owner, built here because this home
+  /// owns the Parakeet registration and handle (plan §3b, the
+  /// `WhisperKitLegacyUpgradeCoordinator` precedent). Set once by
+  /// `installParakeetUpgrade(parakeetSelection:isOnboardingComplete:)`.
+  private(set) var parakeetUpgrade: ParakeetUpgradeCoordinator?
+
+  /// #3546: builds the Parakeet upgrade coordinator around THIS home's Parakeet
+  /// handle and the request provider the caller also gives `ASRManager`.
+  /// Its usability changes reach the same companion observers v3 admission
+  /// does.
+  func installParakeetUpgrade(
+    parakeetSelection: ParakeetSelectionProvider,
+    isOnboardingComplete: @escaping @MainActor () -> Bool
+  ) -> ParakeetUpgradeCoordinator {
+    if let parakeetUpgrade { return parakeetUpgrade }
+    // With the Ultra target, `delivery` is the retired v3 handle (acceptance
+    // only, or nil). Without one (the shipped manifest failed to load), the
+    // no-handle legacy route, unchanged: the retired manifest is never
+    // substituted for the shipped one.
+    let coordinator = ParakeetUpgradeCoordinator(
+      parakeetSelection: parakeetSelection,
+      delivery: parakeetUpgradeTarget == nil ? parakeetHandle : parakeetRetiredV3Handle,
+      target: parakeetUpgradeTarget,
+      isOnboardingComplete: isOnboardingComplete)
+    coordinator.onUsabilityMayHaveChanged = { [weak self] in self?.notifyParakeetUsable() }
+    coordinator.onPresentationChanged = { [weak self] in self?.refreshParakeetPresentation() }
+    // #3546 §3.7 T2: only with the Ultra target is there an upgrade to report.
+    if parakeetUpgradeTarget != nil, let parakeetIdentity {
+      let telemetry = ParakeetUpgradeTelemetry(target: parakeetIdentity)
+      coordinator.onOutcome = { telemetry.observe($0) }
+    }
+    parakeetUpgrade = coordinator
+    refreshParakeetPresentation()
+    return coordinator
+  }
 
   /// #1386 PR-2. Nil when the bundled multilingual manifest failed to load —
   /// unlike Parakeet there is NO legacy fallback behind it (PR-2 retired
@@ -121,27 +234,98 @@ final class ModelDeliveryHome {
   /// run "after Parakeet" without polling the mirror. A list because two owners
   /// wait on it (`LearnFromEditsWiring` for the edit judge, `WordCheckRuntime` for
   /// the word check, #3242); a single slot let the later assignment silently
-  /// replace the earlier one.
-  private var parakeetAdmittedObservers: [@MainActor () -> Void] = []
+  /// replace the earlier one. #3546: also fired when the upgrade coordinator
+  /// reports that usability may have changed (admission, activation,
+  /// fallback, rejection, exhaustion, Retry, Resume). Observers re-read
+  /// `isParakeetUsable()`; a notification grants nothing.
+  private var parakeetUsableObservers: [@MainActor () -> Void] = []
 
-  func addParakeetAdmittedObserver(_ observer: @escaping @MainActor () -> Void) {
-    parakeetAdmittedObservers.append(observer)
+  func addParakeetUsableObserver(_ observer: @escaping @MainActor () -> Void) {
+    parakeetUsableObservers.append(observer)
+  }
+
+  private func notifyParakeetUsable() {
+    for observer in parakeetUsableObservers { observer() }
   }
 
   /// #3385: Settings re-checks the current marker and file stamps. Never trust
   /// the admitted mirror: files may have been removed since it was published.
   /// This read neither ensures availability nor takes an engine mutation claim.
+  /// #3546: with an upgrade target, the identity that serves or will serve
+  /// answers, with rejection and load permission applied, so Ultra's raw
+  /// marker never makes a working v3 look unavailable (or the reverse).
   func currentParakeetAdmission() async -> Bool {
+    if let parakeetUpgrade, parakeetUpgrade.hasUpgradeTarget {
+      return await parakeetUpgrade.currentAdmission()
+    }
     guard let registration = parakeetRegistration else { return false }
     return await controller.isAdmitted(registration)
   }
 
-  /// #996 phase D: whether Parakeet is admitted NOW, from the persisted marker,
+  /// #3546 E12/E13: Settings' Cancel and Resume for the BACKGROUND upgrade.
+  func cancelParakeetUpgradeDownload() {
+    Task { [weak self] in try? await self?.parakeetUpgrade?.cancelBackgroundUpgrade() }
+  }
+
+  func resumeParakeetUpgradeDownload() {
+    Task { [weak self] in try? await self?.parakeetUpgrade?.resumeBackgroundUpgrade() }
+  }
+
+  /// #3546 row T: the explicit Retry. The coordinator must persist a fresh
+  /// bounded cycle first; if that write fails nothing starts, the failure row
+  /// stays and this returns false. It is not gated on the owned-download kill
+  /// switch: with delivery off the load goes through the permitted vendor
+  /// route. Two callers load after a granted cycle: Settings' Try again warms
+  /// through `retryParakeetUpgradeAndWarm`, and onboarding's warming retry
+  /// re-runs its own warm-up.
+  /// Onboarding's warming retry: the explicit Retry only when the policy is
+  /// the reason loading stopped; every other failure retries as before.
+  @discardableResult
+  func retryParakeetUpgradeIfBlocked() -> Bool {
+    guard parakeetNeedsExplicitRetry else { return true }
+    return retryParakeetUpgrade()
+  }
+
+  @discardableResult
+  func retryParakeetUpgrade() -> Bool {
+    guard let parakeetUpgrade else { return false }
+    do {
+      try parakeetUpgrade.retry()
+      return true
+    } catch {
+      Task {
+        await AppLogger.shared.log(
+          "Parakeet Retry refused: the upgrade state could not be written (\(error))",
+          level: .info, category: "Delivery")
+      }
+      return false
+    }
+  }
+
+  /// #3546 row T: the warm-up Settings' Try again runs after a granted cycle.
+  /// Set by the bootstrapper to the Parakeet driver's guarded warm-up.
+  var warmParakeetAfterExplicitRetry: (@MainActor () async -> Void)?
+
+  /// Settings' Try again: grant the bounded cycle, then load now, so the row
+  /// does not clear into a model that waits for the next dictation to load.
+  /// Returns the warm-up it started, nil when nothing started.
+  @discardableResult
+  func retryParakeetUpgradeAndWarm() -> Task<Void, Never>? {
+    guard let warm = warmParakeetAfterExplicitRetry, retryParakeetUpgrade() else { return nil }
+    return Task { await warm() }
+  }
+
+  /// #996 phase D: whether Parakeet is usable NOW, from the persisted marker,
   /// not the in-process mirror. A returning user's Parakeet was admitted in a
   /// previous process, and `parakeetState` stays `.notReady` until the first
   /// dictation calls `ensureAvailable()` (cloud review P2); the judge's "after
-  /// Parakeet" gate must not wait for that.
-  func isParakeetAdmitted() async -> Bool {
+  /// Parakeet" gate must not wait for that. #3546: with an upgrade target the
+  /// coordinator answers (serving readiness, accepted v3, or loadable Ultra);
+  /// without one the answer is the v3 mirror and marker, as before.
+  func isParakeetUsable() async -> Bool {
+    if let parakeetUpgrade, parakeetUpgrade.hasUpgradeTarget {
+      return await parakeetUpgrade.isParakeetUsable()
+    }
     if case .admitted = parakeetState { return true }
     guard let registration = parakeetRegistration else { return false }
     return await controller.isAdmitted(registration)
@@ -269,7 +453,8 @@ final class ModelDeliveryHome {
   ///   store on a developer's machine.
   init(
     engineMutationScope: EngineMutationScope, manifestBundle: Bundle,
-    appSupportOverride: URL? = nil, deliveryFlagDefaults: UserDefaults? = nil
+    appSupportOverride: URL? = nil, deliveryFlagDefaults: UserDefaults? = nil,
+    retiredV3Progress: ParakeetDeliveryHandle.ProgressSink = .shared
   ) {
     self.engineMutationScope = engineMutationScope
     self.checkerDeliveryDefaults = deliveryFlagDefaults
@@ -337,29 +522,15 @@ final class ModelDeliveryHome {
       let manifest = try DeliveryManifest.loadBundled(
         resource: "parakeet-delivery-manifest", bundle: manifestBundle)
       let identity = manifest.identity
+      let metadataDirectory = storage.dataDirectory
+        .appendingPathComponent("ModelDelivery", isDirectory: true)
+      // #3546: the shipped manifest is Parakeet Ultra, in its own owned
+      // directory beside v3's. No shared donor exists for it.
       let registration = DeliveryRegistration(
         manifest: manifest,
-        // #2483: our own directory, a sibling of `Models/whisper` below. This
-        // was `AsrModels.defaultCacheDirectory(for: .v3)` — FluidAudio's SHARED
-        // per-repo cache — from #1348 Phase 2 until now, which is what deleted
-        // other apps' files (#2483) and blocked installs we could not sweep
-        // (#2690). `ParakeetInstallLocation` owns the name, including why the
-        // last path component must stay `parakeet-tdt-0.6b-v3-coreml`.
         installDirectory: ParakeetInstallLocation.directory(
-          dataDirectory: storage.dataDirectory),
-        metadataDirectory: storage.dataDirectory
-          .appendingPathComponent("ModelDelivery", isDirectory: true),
-        // #2483: where this model USED to live, offered read-only so an existing
-        // copy — ours from before the move, or another FluidAudio app's — is
-        // reproduced instead of re-downloaded. Rooted at `appSupportRoot` so a
-        // suite passing an override never reads the real shared directory.
-        // The donor is resolved from the SYSTEM lookup every time, independently
-        // of which candidate won for our data. `nil` means there is no such
-        // directory — never "could not ask" — which is what makes recording its
-        // absence safe.
-        legacyDonorDirectory: storage.systemApplicationSupport.map {
-          ParakeetInstallLocation.legacySharedDonor(appSupport: $0)
-        })
+          for: .ultra, dataDirectory: storage.dataDirectory),
+        metadataDirectory: metadataDirectory)
       parakeetIdentity = identity
       parakeetRegistration = registration
       // #2119: reclaim staging abandoned by a superseded revision of THIS model.
@@ -371,37 +542,24 @@ final class ModelDeliveryHome {
       // could exercise the family flag without writing a live delivery kill
       // switch onto a developer's machine (#2139). Production is unchanged:
       // the only caller that passes a non-nil value is the test suite.
+      // #3546: `.scoped`, because background upgrade work on this identity
+      // must never write the foreground warm-up's progress.
       let handle = ParakeetDeliveryHandle(
-        controller: controller, registration: registration, defaults: deliveryFlagDefaults)
+        controller: controller, registration: registration, defaults: deliveryFlagDefaults,
+        progressOwnership: .scoped, progress: .shared)
       parakeetHandle = handle
-      // #2697: START THE MIGRATION AT LAUNCH, not at the first dictation.
-      //
-      // The seam that guarantees it has run lives in the engine adapter's
-      // warm-up, and warm-up is driven by a recording session — so without this
-      // the whole migration, including a hash of 483 MB, is paid by the user's
-      // FIRST TAKE after updating. Starting it here moves that cost to launch,
-      // where nobody is waiting on it. Measured on the founder's machine: the
-      // migration itself is ~1s.
-      //
-      // Through the HANDLE rather than the controller (review A, P2). The handle
-      // supplies the progress tick; the controller call takes one and launch had
-      // none to give, so a warm-up that JOINED the launch migration inherited a
-      // run reporting nothing — and the sessionless wedge guard reads silence as
-      // a wedge. One door, one tick, whoever arrives first.
-      //
-      // It does not race the seam: every migration now goes through the
-      // controller's single-flight coordinator, so a warm-up arriving mid-run
-      // joins this task rather than starting a second on the same candidate.
-      //
-      // THE RESULT IS DISCARDED HERE, AND ONLY HERE, DELIBERATELY. Every other
-      // caller of this seam ACTS on the location and must honour a refusal:
-      // `resumeParakeetDownload` below guards on it, and
-      // `ParakeetEngineAdapter` throws on it. This call acts on nothing — a
-      // refusal means the migration inside simply did not run, which is the
-      // outcome we want. Enumerated rather than assumed:
-      // `/usr/bin/grep -rn "ensureModelLocationReady" Sources/` returns three
-      // call sites, and this is the only one with nothing to refuse.
-      Task { _ = await handle.ensureModelLocationReady() }
+      parakeetUpgradeTarget = ParakeetUpgradeCoordinator.UpgradeTarget(
+        delivery: handle,
+        store: ParakeetUpgradeStateStore(
+          metadataDirectory: metadataDirectory, targetCacheKey: identity.cacheKey),
+        ownedModelsRoot: storage.dataDirectory.appendingPathComponent("Models", isDirectory: true))
+      installRetiredV3(
+        dataDirectory: storage.dataDirectory, metadataDirectory: metadataDirectory,
+        legacyDonorDirectory: storage.systemApplicationSupport.map {
+          ParakeetInstallLocation.legacySharedDonor(appSupport: $0)
+        },
+        manifestBundle: manifestBundle, deliveryFlagDefaults: deliveryFlagDefaults,
+        progress: retiredV3Progress)
       wireObservers(identity: identity)
     } catch {
       Task {
@@ -826,13 +984,96 @@ final class ModelDeliveryHome {
     }
   }
 
+  /// #3546: the retired v3 manifest, for acceptance only (plan §3.4 "v3
+  /// accepted"). Built only after the shipped manifest loaded, so a failure of
+  /// either never substitutes one identity for the other.
+  private func installRetiredV3(
+    dataDirectory: URL, metadataDirectory: URL, legacyDonorDirectory: URL?,
+    manifestBundle: Bundle, deliveryFlagDefaults: UserDefaults?,
+    progress: ParakeetDeliveryHandle.ProgressSink
+  ) {
+    do {
+      let manifest = try DeliveryManifest.loadBundled(
+        resource: "parakeet-v3-retired-manifest", bundle: manifestBundle)
+      let registration = DeliveryRegistration(
+        manifest: manifest,
+        // #2483: our own directory, a sibling of `Models/whisper` below. This
+        // was `AsrModels.defaultCacheDirectory(for: .v3)` — FluidAudio's SHARED
+        // per-repo cache — from #1348 Phase 2 until now, which is what deleted
+        // other apps' files (#2483) and blocked installs we could not sweep
+        // (#2690). `ParakeetInstallLocation` owns the name, including why the
+        // last path component must stay `parakeet-tdt-0.6b-v3-coreml`.
+        installDirectory: ParakeetInstallLocation.directory(dataDirectory: dataDirectory),
+        metadataDirectory: metadataDirectory,
+        // #2483: where this model USED to live, offered read-only so an existing
+        // copy — ours from before the move, or another FluidAudio app's — is
+        // reproduced instead of re-downloaded. Rooted at `appSupportRoot` so a
+        // suite passing an override never reads the real shared directory.
+        // The donor is resolved from the SYSTEM lookup every time, independently
+        // of which candidate won for our data. `nil` means there is no such
+        // directory — never "could not ask" — which is what makes recording its
+        // absence safe.
+        legacyDonorDirectory: legacyDonorDirectory)
+      parakeetRetiredV3Registration = registration
+      // Acceptance never fetches, so it never owns download progress; its
+      // validation and migration ticks are the foreground's (selection points).
+      let handle = ParakeetDeliveryHandle(
+        controller: controller, registration: registration, defaults: deliveryFlagDefaults,
+        progressOwnership: .always, progress: progress)
+      parakeetRetiredV3Handle = handle
+      // #2697: START THE MIGRATION AT LAUNCH, not at the first dictation.
+      //
+      // The seam that guarantees it has run lives in the engine adapter's
+      // warm-up, and warm-up is driven by a recording session — so without this
+      // the whole migration, including a hash of 483 MB, is paid by the user's
+      // FIRST TAKE after updating. Starting it here moves that cost to launch,
+      // where nobody is waiting on it. Measured on the founder's machine: the
+      // migration itself is ~1s.
+      //
+      // Through the HANDLE rather than the controller (review A, P2). The handle
+      // supplies the progress tick; the controller call takes one and launch had
+      // none to give, so a warm-up that JOINED the launch migration inherited a
+      // run reporting nothing — and the sessionless wedge guard reads silence as
+      // a wedge. One door, one tick, whoever arrives first.
+      //
+      // It does not race the seam: every migration now goes through the
+      // controller's single-flight coordinator, so a warm-up arriving mid-run
+      // joins this task rather than starting a second on the same candidate.
+      //
+      // THE RESULT IS DISCARDED HERE, AND ONLY HERE, DELIBERATELY. Every other
+      // caller of this seam ACTS on the location and must honour a refusal:
+      // `resumeParakeetDownload` below guards on it, and
+      // `ParakeetUpgradeCoordinator`'s no-target delivery stage throws on it
+      // (#3546: moved there from `ParakeetEngineAdapter`). This call acts on
+      // nothing — a refusal means the migration inside simply did not run,
+      // which is the outcome we want. Enumerated rather than assumed:
+      // `/usr/bin/grep -rn "ensureModelLocationReady" Sources/` returns three
+      // call sites, and this is the only one with nothing to refuse.
+      // (#3546: the task is kept only so a test can wait for the migration
+      // construction started; nothing in production reads it or its result.)
+      retiredV3LaunchMigrationForTesting = Task { await handle.ensureModelLocationReady() }
+    } catch {
+      Task {
+        await AppLogger.shared.log(
+          "Retired Parakeet v3 manifest unavailable — an existing v3 install is not accepted: \(error)",
+          level: .info, category: "Delivery")
+      }
+    }
+  }
+
   private func wireObservers(identity: ModelIdentity) {
     let home = self
     let registration = parakeetRegistration
+    let retiredV3 = parakeetRetiredV3Registration
     let sequencer = DeliveryStateSequencer()
-    Task {
+    parakeetObserverSetupForTesting = Task {
       if let registration {
-        let admitted = await controller.isAdmitted(registration)
+        // #3546: a user upgrading from an admitted v3 is not on a first run.
+        var admitted = await controller.isAdmitted(registration)
+        var v3Admitted = false
+        if let retiredV3 { v3Admitted = await controller.isAdmitted(retiredV3) }
+        if !admitted, retiredV3 != nil { admitted = v3Admitted }
+        await MainActor.run { home.parakeetFallbackModel = v3Admitted ? .v3 : .ultra }
         await MainActor.run { home.firstRunByIdentity[identity] = !admitted }
       }
       await controller.addStateObserver { observedIdentity, state in
@@ -847,7 +1088,7 @@ final class ModelDeliveryHome {
           home.parakeetStateUpdatesForTests += 1
           if case .admitted = state {
             home.firstRunByIdentity[observedIdentity] = false
-            for observer in home.parakeetAdmittedObservers { observer() }
+            home.notifyParakeetUsable()
           }
         }
       }
@@ -892,7 +1133,13 @@ final class ModelDeliveryHome {
       // #1707 Phase 3 (§3.2, row 17): hold a mutation claim for the FULL
       // cancel-drain.
       _ = await self.engineMutationScope.withClaim(site: "parakeetCancelDownload") {
-        _ = await self.controller.cancel(identity)
+        // #3546: with an upgrade target the foreground fetch is the
+        // coordinator's, so its foreground Cancel owns the drain (no decline).
+        if let upgrade = self.parakeetUpgrade, upgrade.hasUpgradeTarget {
+          await upgrade.cancelActiveFetch()
+        } else {
+          _ = await self.controller.cancel(identity)
+        }
       }
     }
   }
@@ -1101,7 +1348,8 @@ final class ModelDeliveryHome {
   ///
   /// **What the flag does NOT do**, so nobody reads this guard as more than it is:
   /// it stands owned delivery down and hands Parakeet back to the legacy
-  /// FluidAudio path, which fetches on its own (`parakeetCacheOnly = false`). It
+  /// FluidAudio path, which fetches on its own (a load request with `cacheOnly`
+  /// false; before #3546, `parakeetCacheOnly = false`). It
   /// also does not stop an attempt already in flight — the controller snapshots
   /// flags once per attempt — so flipping it mid-download leaves the Settings row
   /// showing progress and Cancel, exactly as before.
@@ -1176,7 +1424,13 @@ final class ModelDeliveryHome {
         // for that run rather than racing it, and `nil` from it is a refusal
         // this path must honour like any other.
         guard await handle.ensureModelLocationReady() != nil else { return }
-        _ = await handle.ensureAvailable()
+        // #3546: with an upgrade target the coordinator runs the fetch as a
+        // counted foreground operation (progress, location, budget, Cancel).
+        if let upgrade = self.parakeetUpgrade, upgrade.hasUpgradeTarget {
+          _ = await upgrade.fetchInForeground()
+        } else {
+          _ = await handle.ensureAvailable()
+        }
       }
     }
   }

@@ -82,6 +82,7 @@ struct CancellationSilentUnwindTests {
       inputs: .init(
         audioCapture: audioCapture,
         asrManager: asrManager,
+        parakeetUpgrade: .legacyForTesting(),
         vadSignalSource: vad,
         transcriptStore: TranscriptStore(),
         keychainManager: KeychainManager(),

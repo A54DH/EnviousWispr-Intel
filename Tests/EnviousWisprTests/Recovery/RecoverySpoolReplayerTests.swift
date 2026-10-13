@@ -29,11 +29,6 @@ struct RecoverySpoolReplayerTests {
   /// optional hook when `transcribe`/`loadModel` is entered (to simulate a
   /// mid-flight Discard or a filesystem flip), and can throw a scripted error.
   final class FakeBatchASR: ASRManagerInterface {
-    /// #2697: real storage, because the protocol no longer carries a default.
-    /// The default answered an assumed install directory, so a double that never
-    /// set one still reported a usable path. `nil` means nobody has said where the
-    /// model is, which is what a double that loads nothing should say.
-    var parakeetModelDirectory: URL?
     var activeBackendType: ASRBackendType = .parakeet
     var isModelLoaded = false
     let vendorDecodeOccupancy = VendorDecodeOccupancy()
@@ -72,7 +67,10 @@ struct RecoverySpoolReplayerTests {
     func setInitialBackendType(_ type: ASRBackendType) { activeBackendType = type }
     func switchBackend(to type: ASRBackendType) async { activeBackendType = type }
     var activeBackendSupportsStreaming: Bool { get async { false } }
-    func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult
+    func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws -> ASRResult
     {
       transcribeCallCount += 1
       onTranscribe?()
@@ -81,7 +79,10 @@ struct RecoverySpoolReplayerTests {
         text: cannedText, language: options.language, duration: 1, processingTime: 1,
         backendType: activeBackendType)
     }
-    func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws {}
+    func startStreaming(
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws {}
     func feedAudio(_ buffer: AVAudioPCMBuffer) async throws {}
     func finalizeStreaming() async throws -> ASRResult {
       ASRResult(text: "", language: nil, duration: 0, processingTime: 0, backendType: .parakeet)
@@ -172,7 +173,7 @@ struct RecoverySpoolReplayerTests {
       activeEngine: ActiveEngineOperation(
         isLoaded: { asr.isModelLoaded },
         load: { try await asr.loadModel() },
-        transcribe: { samples, options in
+        transcribe: { samples, options, _ in
           try await asr.transcribe(audioSamples: samples, options: options)
         },
         hardCancel: {}),
@@ -824,7 +825,7 @@ struct RecoverySpoolReplayerTests {
         activeEngine: ActiveEngineOperation(
           isLoaded: { inlineASR.isModelLoaded },
           load: { try await inlineASR.loadModel() },
-          transcribe: { samples, options in
+          transcribe: { samples, options, _ in
             try await inlineASR.transcribe(audioSamples: samples, options: options)
           },
           hardCancel: {}),

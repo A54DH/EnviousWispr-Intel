@@ -25,7 +25,7 @@ import Testing
   @Test("makeParakeetAdapter returns a .parakeet-identity adapter")
   func makeParakeetAdapterHasParakeetIdentity() {
     let adapter = KernelAdapterFactory.makeParakeetAdapter(
-      asrManager: MinimalASRManager())
+      asrManager: MinimalASRManager(), parakeetUpgrade: .legacyForTesting())
     #expect(adapter.engineIdentity.backendType == .parakeet)
   }
 
@@ -38,7 +38,8 @@ import Testing
       languageDetector: LanguageDetector(),
       audioCaptureSessionIDSource: { 0 },
       engineMutationScope: .alwaysAllowedForTesting,
-      vendorDecodeOccupancy: VendorDecodeOccupancy())
+      vendorDecodeOccupancy: VendorDecodeOccupancy(),
+      deliveredModelIdentity: nil)
     #expect(adapter.engineIdentity.backendType == .whisperKit)
   }
 }
@@ -48,11 +49,6 @@ import Testing
 /// `.parakeet` regardless of manager behavior, so every member is an inert stub.
 @MainActor
 private final class MinimalASRManager: ASRManagerInterface {
-  /// #2697: real storage, because the protocol no longer carries a default.
-  /// The default answered an assumed install directory, so a double that never
-  /// set one still reported a usable path. `nil` means nobody has said where the
-  /// model is, which is what a double that loads nothing should say.
-  var parakeetModelDirectory: URL?
   var activeBackendType: ASRBackendType = .parakeet
   var isModelLoaded = false
   let vendorDecodeOccupancy = VendorDecodeOccupancy()
@@ -70,10 +66,16 @@ private final class MinimalASRManager: ASRManagerInterface {
   func setInitialBackendType(_ type: ASRBackendType) {}
   func switchBackend(to type: ASRBackendType) async {}
   var activeBackendSupportsStreaming: Bool { get async { false } }
-  func transcribe(audioSamples: [Float], options: TranscriptionOptions) async throws -> ASRResult {
+  func transcribe(
+    audioSamples: [Float], options: TranscriptionOptions,
+    onInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws -> ASRResult {
     ASRResult(text: "", language: "en", duration: 0, processingTime: 0, backendType: .parakeet)
   }
-  func startStreaming(options: TranscriptionOptions, attemptID: UUID) async throws {}
+  func startStreaming(
+    options: TranscriptionOptions, attemptID: UUID,
+    onWindowInferenceEntered: ASRInferenceEntryObserver? = nil
+  ) async throws {}
   func feedAudio(_ buffer: AVAudioPCMBuffer) async throws {}
   func finalizeStreaming() async throws -> ASRResult {
     ASRResult(text: "", language: "en", duration: 0, processingTime: 0, backendType: .parakeet)
