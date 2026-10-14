@@ -1856,6 +1856,13 @@ package final class WisprBootstrapper {
       }
     )
 
+    #if DEBUG
+      appLifecycleCoordinator.qualificationChildTrap = {
+        [coordinator = egOneRuntime.serverCoordinator] in
+        await coordinator.qualificationTrapOwnedReadyChild()
+      }
+    #endif
+
     self.navigationCoordinator = navigationCoordinator
     self.diagnosticsCoordinator = diagnosticsCoordinator
     #if DEBUG
