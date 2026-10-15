@@ -1,0 +1,723 @@
+#if DEBUG
+  import AppKit
+  import EnviousWisprAudio
+  import EnviousWisprCore
+  import EnviousWisprServices
+  import Foundation
+
+  /// #3765: the dev control door's table of every `SettingsManager.SettingKey`.
+  ///
+  /// Three switches over `SettingKey`, none with a `default`, so a new setting does not
+  /// compile in a DEBUG build until it is placed in a kind, given a JSON reading, and given
+  /// a typed forced assignment. `allKeys` is the list the door exposes; a test compares it
+  /// with the enum's declaration in source, because an exhaustive switch cannot notice a
+  /// case that is missing from a list.
+  ///
+  /// **Forced writes assign the typed property** (`settings.<property> = value`), so the
+  /// property's own `didSet` still persists, notifies and canonicalizes exactly as a screen
+  /// write does. Force skips only the screens' policy (ranges, offered choices, conflicts,
+  /// coupled picks). The one check force keeps is crash prevention for a value a consumer
+  /// converts unsafely (`vadSilenceTimeout`).
+  @MainActor
+  enum DevControlSettings {
+    typealias Key = SettingsManager.SettingKey
+
+    /// How a non-forced write reaches the setting (plan §3.4).
+    enum Kind: String {
+      /// The screen assigns the property directly.
+      case direct
+      /// The screen goes through an owner's helper with its preconditions.
+      case viaOwner
+      /// The screen's check lives in a view today; PR-C moves it into a shared owner.
+      case extractedCheck
+      /// No current screen operation writes it, or it is legacy; type checks only.
+      case staging
+    }
+
+    struct Entry: Equatable {
+      let key: Key
+      let name: String
+      let kind: Kind
+      /// The PR that delivers the non-forced route, or nil when it exists in this build.
+      let deferredTo: String?
+      let legacy: Bool
+    }
+
+    enum WriteOutcome: Equatable {
+      case written(forced: Bool)
+      case badValue(String)
+    }
+
+    /// Every key, once, in declaration order.
+    static let allKeys: [Key] = [
+      .selectedBackend, .recordingMode, .llmProvider, .llmModel, .ollamaModel,
+      .fileImportLLMProvider, .fileImportLLMModel, .fileImportOllamaModel,
+      .s1MiniStyling, .s1MiniStructure, .s1MiniContext, .autoCopyToClipboard, .hotkeyEnabled,
+      .vadAutoStop, .vadSilenceTimeout, .vadSensitivity, .vadEnergyGate, .onboardingState,
+      .hasCompletedOnboarding, .cancelKeyCode, .cancelModifiers, .quickAddKeyCode,
+      .quickAddModifiers, .pasteLastKeyCode, .pasteLastModifiers, .copyLastKeyCode,
+      .copyLastModifiers, .toggleKeyCode, .toggleModifiers, .pushToTalkKeyCode,
+      .pushToTalkModifiers, .modelUnloadPolicy, .restoreClipboardAfterPaste,
+      .keepDictationsOutOfClipboardHistory, .quickAddClipboardFallback, .smartInsertion,
+      .escapeRecoveryEnabled, .wordCorrectionEnabled, .fillerRemovalEnabled,
+      .emojiFormatterEnabled, .spokenPunctuation, .casualModeEnabled, .crashRecoveryEnabled,
+      .shareUsageMetrics, .sendCrashReports, .contactsSyncOnLaunchEnabled, .isDebugModeEnabled,
+      .isDictationAudioArchiveEnabled, .debugLogLevel, .whisperKitLanguage, .languageMode,
+      .englishSpelling, .selectedInputDeviceUID, .preferredInputDeviceIDOverride,
+      .inputChannelByDeviceUID, .useStreamingASR, .livePreviewEnabled, .livePreviewEngine,
+      .warmEnginePolicy, .appearance, .overlayPillPosition, .recordingPillDesignWithoutWords,
+      .recordingPillDesignWithWords, .showBluetoothTips, .showInDock, .showMenuBarUpdateAlert,
+      .playRecordingSounds, .recordingSoundPairing, .otherAudioWhileDictating, .learnFromEdits,
+    ]
+
+    /// The wire name: the enum case's own name.
+    static func name(_ key: Key) -> String { String(describing: key) }
+
+    static func key(named name: String) -> Key? {
+      allKeys.first { self.name($0) == name }
+    }
+
+    // MARK: - Membership
+
+    static func entry(_ key: Key) -> Entry {
+      func make(_ kind: Kind, deferredTo: String? = nil, legacy: Bool = false) -> Entry {
+        Entry(key: key, name: name(key), kind: kind, deferredTo: deferredTo, legacy: legacy)
+      }
+      switch key {
+      case .selectedBackend, .recordingMode, .llmProvider, .llmModel, .s1MiniStyling,
+        .s1MiniStructure, .s1MiniContext, .autoCopyToClipboard, .vadAutoStop, .modelUnloadPolicy,
+        .restoreClipboardAfterPaste, .keepDictationsOutOfClipboardHistory,
+        .quickAddClipboardFallback, .smartInsertion, .escapeRecoveryEnabled,
+        .wordCorrectionEnabled, .fillerRemovalEnabled, .emojiFormatterEnabled,
+        .casualModeEnabled, .shareUsageMetrics, .sendCrashReports, .contactsSyncOnLaunchEnabled,
+        .isDebugModeEnabled, .isDictationAudioArchiveEnabled, .debugLogLevel, .useStreamingASR,
+        .livePreviewEnabled, .livePreviewEngine, .warmEnginePolicy, .appearance,
+        .overlayPillPosition, .showBluetoothTips, .showInDock, .showMenuBarUpdateAlert,
+        .playRecordingSounds, .recordingSoundPairing, .otherAudioWhileDictating, .learnFromEdits:
+        return make(.direct)
+      case .selectedInputDeviceUID, .preferredInputDeviceIDOverride, .spokenPunctuation,
+        .hasCompletedOnboarding:
+        return make(.viaOwner)
+      case .recordingPillDesignWithoutWords, .recordingPillDesignWithWords, .languageMode,
+        .englishSpelling:
+        return make(.viaOwner, deferredTo: "PR-B")
+      case .cancelKeyCode, .cancelModifiers, .quickAddKeyCode, .quickAddModifiers,
+        .pasteLastKeyCode, .pasteLastModifiers, .copyLastKeyCode, .copyLastModifiers,
+        .toggleKeyCode, .toggleModifiers, .fileImportLLMProvider, .fileImportLLMModel,
+        .fileImportOllamaModel, .ollamaModel, .vadSilenceTimeout, .inputChannelByDeviceUID:
+        return make(.extractedCheck, deferredTo: "PR-C")
+      case .hotkeyEnabled, .vadSensitivity, .vadEnergyGate, .crashRecoveryEnabled,
+        .onboardingState:
+        return make(.staging)
+      case .whisperKitLanguage, .pushToTalkKeyCode, .pushToTalkModifiers:
+        return make(.staging, legacy: true)
+      }
+    }
+
+    // MARK: - Reads
+
+    /// The setting's current value as a JSON value (`NSNull` for an absent optional).
+    static func read(_ key: Key, from settings: SettingsManager) -> Any {
+      switch key {
+      case .selectedBackend: return settings.selectedBackend.rawValue
+      case .recordingMode: return settings.recordingMode.rawValue
+      case .llmProvider: return settings.llmProvider.rawValue
+      case .llmModel: return settings.llmModel
+      case .ollamaModel: return settings.ollamaModel
+      case .fileImportLLMProvider:
+        return settings.fileImportLLMProvider.map { $0.rawValue as Any } ?? NSNull()
+      case .fileImportLLMModel: return settings.fileImportLLMModel
+      case .fileImportOllamaModel: return settings.fileImportOllamaModel
+      case .s1MiniStyling: return settings.s1MiniStyling.rawValue
+      case .s1MiniStructure: return settings.s1MiniStructure.rawValue
+      case .s1MiniContext: return settings.s1MiniContext.rawValue
+      case .autoCopyToClipboard: return settings.autoCopyToClipboard
+      case .hotkeyEnabled: return settings.hotkeyEnabled
+      case .vadAutoStop: return settings.vadAutoStop
+      case .vadSilenceTimeout: return settings.vadSilenceTimeout
+      case .vadSensitivity: return Double(settings.vadSensitivity)
+      case .vadEnergyGate: return settings.vadEnergyGate
+      case .onboardingState: return settings.onboardingState.rawValue
+      case .hasCompletedOnboarding: return settings.hasCompletedOnboarding
+      case .cancelKeyCode: return Int(settings.cancelKeyCode)
+      case .cancelModifiers: return settings.cancelModifiers.rawValue
+      case .quickAddKeyCode: return Int(settings.quickAddKeyCode)
+      case .quickAddModifiers: return settings.quickAddModifiers.rawValue
+      case .pasteLastKeyCode: return Int(settings.pasteLastKeyCode)
+      case .pasteLastModifiers: return settings.pasteLastModifiers.rawValue
+      case .copyLastKeyCode: return Int(settings.copyLastKeyCode)
+      case .copyLastModifiers: return settings.copyLastModifiers.rawValue
+      case .toggleKeyCode: return Int(settings.toggleKeyCode)
+      case .toggleModifiers: return settings.toggleModifiers.rawValue
+      case .pushToTalkKeyCode: return Int(settings.pushToTalkKeyCode)
+      case .pushToTalkModifiers: return settings.pushToTalkModifiers.rawValue
+      case .modelUnloadPolicy: return settings.modelUnloadPolicy.rawValue
+      case .restoreClipboardAfterPaste: return settings.restoreClipboardAfterPaste
+      case .keepDictationsOutOfClipboardHistory: return settings.keepDictationsOutOfClipboardHistory
+      case .quickAddClipboardFallback: return settings.quickAddClipboardFallback
+      case .smartInsertion: return settings.smartInsertion
+      case .escapeRecoveryEnabled: return settings.escapeRecoveryEnabled
+      case .wordCorrectionEnabled: return settings.wordCorrectionEnabled
+      case .fillerRemovalEnabled: return settings.fillerRemovalEnabled
+      case .emojiFormatterEnabled: return settings.emojiFormatterEnabled
+      case .spokenPunctuation: return Codec.encode(settings.spokenPunctuation)
+      case .casualModeEnabled: return settings.casualModeEnabled
+      case .crashRecoveryEnabled: return settings.crashRecoveryEnabled
+      case .shareUsageMetrics: return settings.shareUsageMetrics
+      case .sendCrashReports: return settings.sendCrashReports
+      case .contactsSyncOnLaunchEnabled: return settings.contactsSyncOnLaunchEnabled
+      case .isDebugModeEnabled: return settings.isDebugModeEnabled
+      case .isDictationAudioArchiveEnabled: return settings.isDictationAudioArchiveEnabled
+      case .debugLogLevel: return settings.debugLogLevel.rawValue
+      case .whisperKitLanguage: return settings.whisperKitLanguage
+      case .languageMode: return Codec.encode(settings.languageMode)
+      case .englishSpelling: return settings.englishSpelling.rawValue
+      case .selectedInputDeviceUID: return settings.selectedInputDeviceUID
+      case .preferredInputDeviceIDOverride: return settings.preferredInputDeviceIDOverride
+      case .inputChannelByDeviceUID: return settings.inputChannelByDeviceUID
+      case .useStreamingASR: return settings.useStreamingASR
+      case .livePreviewEnabled: return settings.livePreviewEnabled
+      case .livePreviewEngine: return settings.livePreviewEngine.rawValue
+      case .warmEnginePolicy: return settings.warmEnginePolicy.rawValue
+      case .appearance: return settings.appearancePreference.rawValue
+      case .overlayPillPosition: return settings.overlayPillPosition.rawValue
+      case .recordingPillDesignWithoutWords:
+        return settings.recordingPillDesignWithoutWords.rawValue
+      case .recordingPillDesignWithWords: return settings.recordingPillDesignWithWords.rawValue
+      case .showBluetoothTips: return settings.showBluetoothTips
+      case .showInDock: return settings.showInDock
+      case .showMenuBarUpdateAlert: return settings.showMenuBarUpdateAlert
+      case .playRecordingSounds: return settings.playRecordingSounds
+      case .recordingSoundPairing: return settings.recordingSoundPairing.rawValue
+      case .otherAudioWhileDictating: return settings.otherAudioWhileDictating.rawValue
+      case .learnFromEdits: return settings.learnFromEdits
+      }
+    }
+
+    /// One catalog row per key: name, current value and how it is written.
+    static func catalog(_ settings: SettingsManager) -> [[String: Any]] {
+      allKeys.map { key in
+        let entry = entry(key)
+        return [
+          "name": entry.name,
+          "value": read(key, from: settings),
+          "kind": entry.kind.rawValue,
+          "deferredTo": entry.deferredTo.map { $0 as Any } ?? NSNull(),
+          "legacy": entry.legacy,
+        ]
+      }
+    }
+
+    // MARK: - Forced writes
+
+    /// Decodes `value` to the property's type and assigns it, skipping the screens' policy.
+    /// Nothing is assigned when decoding or the crash-prevention check fails.
+    static func forceWrite(_ key: Key, value: Any, to settings: SettingsManager) -> WriteOutcome {
+      attributed(settings) { assign(key, value: value, to: settings, forced: true) }
+    }
+
+    /// Runs `body` with `settings.isDevControlWrite` set, so every change notification the
+    /// write causes (including a setter's synchronous consequences, such as the model a
+    /// provider change canonicalizes) is attributed to the door. Restores the caller's prior
+    /// value, so nested use keeps an enclosing scope open. Synchronous: never await inside.
+    static func attributed<T>(_ settings: SettingsManager, _ body: () -> T) -> T {
+      let prior = settings.isDevControlWrite
+      settings.isDevControlWrite = true
+      defer { settings.isDevControlWrite = prior }
+      return body()
+    }
+
+    /// The one property mapping: decode to the property's type, keep the crash-prevention
+    /// check, assign through the typed setter. `forced` only labels the outcome; ordinary
+    /// writes reach this after their route's own checks.
+    private static func assign(
+      _ key: Key, value: Any, to settings: SettingsManager, forced: Bool
+    ) -> WriteOutcome {
+      func set<T>(_ decoded: T?, _ assign: (T) -> Void) -> WriteOutcome {
+        guard let decoded else { return .badValue("wrong type or unknown value") }
+        assign(decoded)
+        return .written(forced: forced)
+      }
+      switch key {
+      case .selectedBackend:
+        return set(Codec.raw(value, ASRBackendType.self)) { settings.selectedBackend = $0 }
+      case .recordingMode:
+        return set(Codec.raw(value, RecordingMode.self)) { settings.recordingMode = $0 }
+      case .llmProvider:
+        return set(Codec.raw(value, LLMProvider.self)) { settings.llmProvider = $0 }
+      case .llmModel:
+        return set(Codec.string(value)) { settings.llmModel = $0 }
+      case .ollamaModel:
+        return set(Codec.string(value)) { settings.ollamaModel = $0 }
+      case .fileImportLLMProvider:
+        return set(Codec.optionalRaw(value, LLMProvider.self)) {
+          settings.fileImportLLMProvider = $0
+        }
+      case .fileImportLLMModel:
+        return set(Codec.string(value)) { settings.fileImportLLMModel = $0 }
+      case .fileImportOllamaModel:
+        return set(Codec.string(value)) { settings.fileImportOllamaModel = $0 }
+      case .s1MiniStyling:
+        return set(Codec.raw(value, S1Styling.self)) { settings.s1MiniStyling = $0 }
+      case .s1MiniStructure:
+        return set(Codec.raw(value, S1Structure.self)) { settings.s1MiniStructure = $0 }
+      case .s1MiniContext:
+        return set(Codec.raw(value, S1Context.self)) { settings.s1MiniContext = $0 }
+      case .autoCopyToClipboard:
+        return set(Codec.bool(value)) { settings.autoCopyToClipboard = $0 }
+      case .hotkeyEnabled:
+        return set(Codec.bool(value)) { settings.hotkeyEnabled = $0 }
+      case .vadAutoStop:
+        return set(Codec.bool(value)) { settings.vadAutoStop = $0 }
+      case .vadSilenceTimeout:
+        guard let seconds = Codec.double(value) else { return .badValue("wrong type") }
+        guard Self.silenceTimeoutIsConvertible(seconds) else {
+          return .badValue("silence timeout too large for the detector's chunk count")
+        }
+        settings.vadSilenceTimeout = seconds
+        return .written(forced: forced)
+      case .vadSensitivity:
+        return set(Codec.float(value)) { settings.vadSensitivity = $0 }
+      case .vadEnergyGate:
+        return set(Codec.bool(value)) { settings.vadEnergyGate = $0 }
+      case .onboardingState:
+        return set(Codec.raw(value, OnboardingState.self)) { settings.onboardingState = $0 }
+      case .hasCompletedOnboarding:
+        return set(Codec.bool(value)) { settings.hasCompletedOnboarding = $0 }
+      case .cancelKeyCode:
+        return set(Codec.uint16(value)) { settings.cancelKeyCode = $0 }
+      case .cancelModifiers:
+        return set(Codec.modifiers(value)) { settings.cancelModifiers = $0 }
+      case .quickAddKeyCode:
+        return set(Codec.uint16(value)) { settings.quickAddKeyCode = $0 }
+      case .quickAddModifiers:
+        return set(Codec.modifiers(value)) { settings.quickAddModifiers = $0 }
+      case .pasteLastKeyCode:
+        return set(Codec.uint16(value)) { settings.pasteLastKeyCode = $0 }
+      case .pasteLastModifiers:
+        return set(Codec.modifiers(value)) { settings.pasteLastModifiers = $0 }
+      case .copyLastKeyCode:
+        return set(Codec.uint16(value)) { settings.copyLastKeyCode = $0 }
+      case .copyLastModifiers:
+        return set(Codec.modifiers(value)) { settings.copyLastModifiers = $0 }
+      case .toggleKeyCode:
+        return set(Codec.uint16(value)) { settings.toggleKeyCode = $0 }
+      case .toggleModifiers:
+        return set(Codec.modifiers(value)) { settings.toggleModifiers = $0 }
+      case .pushToTalkKeyCode:
+        return set(Codec.uint16(value)) { settings.pushToTalkKeyCode = $0 }
+      case .pushToTalkModifiers:
+        return set(Codec.modifiers(value)) { settings.pushToTalkModifiers = $0 }
+      case .modelUnloadPolicy:
+        return set(Codec.raw(value, ModelUnloadPolicy.self)) { settings.modelUnloadPolicy = $0 }
+      case .restoreClipboardAfterPaste:
+        return set(Codec.bool(value)) { settings.restoreClipboardAfterPaste = $0 }
+      case .keepDictationsOutOfClipboardHistory:
+        return set(Codec.bool(value)) { settings.keepDictationsOutOfClipboardHistory = $0 }
+      case .quickAddClipboardFallback:
+        return set(Codec.bool(value)) { settings.quickAddClipboardFallback = $0 }
+      case .smartInsertion:
+        return set(Codec.bool(value)) { settings.smartInsertion = $0 }
+      case .escapeRecoveryEnabled:
+        return set(Codec.bool(value)) { settings.escapeRecoveryEnabled = $0 }
+      case .wordCorrectionEnabled:
+        return set(Codec.bool(value)) { settings.wordCorrectionEnabled = $0 }
+      case .fillerRemovalEnabled:
+        return set(Codec.bool(value)) { settings.fillerRemovalEnabled = $0 }
+      case .emojiFormatterEnabled:
+        return set(Codec.bool(value)) { settings.emojiFormatterEnabled = $0 }
+      case .spokenPunctuation:
+        return set(Codec.spokenPunctuation(value)) { settings.spokenPunctuation = $0 }
+      case .casualModeEnabled:
+        return set(Codec.bool(value)) { settings.casualModeEnabled = $0 }
+      case .crashRecoveryEnabled:
+        return set(Codec.bool(value)) { settings.crashRecoveryEnabled = $0 }
+      case .shareUsageMetrics:
+        return set(Codec.bool(value)) { settings.shareUsageMetrics = $0 }
+      case .sendCrashReports:
+        return set(Codec.bool(value)) { settings.sendCrashReports = $0 }
+      case .contactsSyncOnLaunchEnabled:
+        return set(Codec.bool(value)) { settings.contactsSyncOnLaunchEnabled = $0 }
+      case .isDebugModeEnabled:
+        return set(Codec.bool(value)) { settings.isDebugModeEnabled = $0 }
+      case .isDictationAudioArchiveEnabled:
+        return set(Codec.bool(value)) { settings.isDictationAudioArchiveEnabled = $0 }
+      case .debugLogLevel:
+        return set(Codec.raw(value, DebugLogLevel.self)) { settings.debugLogLevel = $0 }
+      case .whisperKitLanguage:
+        return set(Codec.string(value)) { settings.whisperKitLanguage = $0 }
+      case .languageMode:
+        return set(Codec.languageMode(value)) { settings.languageMode = $0 }
+      case .englishSpelling:
+        return set(Codec.raw(value, EnglishSpelling.self)) { settings.englishSpelling = $0 }
+      case .selectedInputDeviceUID:
+        return set(Codec.string(value)) { settings.selectedInputDeviceUID = $0 }
+      case .preferredInputDeviceIDOverride:
+        return set(Codec.string(value)) { settings.preferredInputDeviceIDOverride = $0 }
+      case .inputChannelByDeviceUID:
+        return set(Codec.channelMap(value)) { settings.inputChannelByDeviceUID = $0 }
+      case .useStreamingASR:
+        return set(Codec.bool(value)) { settings.useStreamingASR = $0 }
+      case .livePreviewEnabled:
+        return set(Codec.bool(value)) { settings.livePreviewEnabled = $0 }
+      case .livePreviewEngine:
+        return set(Codec.raw(value, LivePreviewEngineChoice.self)) {
+          settings.livePreviewEngine = $0
+        }
+      case .warmEnginePolicy:
+        return set(Codec.raw(value, WarmEnginePolicy.self)) { settings.warmEnginePolicy = $0 }
+      case .appearance:
+        return set(Codec.raw(value, AppearancePreference.self)) {
+          settings.appearancePreference = $0
+        }
+      case .overlayPillPosition:
+        return set(Codec.raw(value, OverlayPillPosition.self)) { settings.overlayPillPosition = $0 }
+      case .recordingPillDesignWithoutWords:
+        return set(Codec.raw(value, RecordingPillDesign.self)) {
+          settings.recordingPillDesignWithoutWords = $0
+        }
+      case .recordingPillDesignWithWords:
+        return set(Codec.raw(value, RecordingPillDesign.self)) {
+          settings.recordingPillDesignWithWords = $0
+        }
+      case .showBluetoothTips:
+        return set(Codec.bool(value)) { settings.showBluetoothTips = $0 }
+      case .showInDock:
+        return set(Codec.bool(value)) { settings.showInDock = $0 }
+      case .showMenuBarUpdateAlert:
+        return set(Codec.bool(value)) { settings.showMenuBarUpdateAlert = $0 }
+      case .playRecordingSounds:
+        return set(Codec.bool(value)) { settings.playRecordingSounds = $0 }
+      case .recordingSoundPairing:
+        return set(Codec.raw(value, RecordingSoundPairing.self)) {
+          settings.recordingSoundPairing = $0
+        }
+      case .otherAudioWhileDictating:
+        return set(Codec.raw(value, OtherAudioWhileDictating.self)) {
+          settings.otherAudioWhileDictating = $0
+        }
+      case .learnFromEdits:
+        return set(Codec.bool(value)) { settings.learnFromEdits = $0 }
+      }
+    }
+
+    // MARK: - Ordinary writes
+
+    /// What a non-forced write needs from the running app, injected so tests never read
+    /// live discovery state or enumerate real audio hardware.
+    struct WriteContext {
+      /// The polish model catalog discovery currently holds, and the provider it is about.
+      var modelCatalog: () -> ModelCatalog
+      /// UIDs of the input devices the system lists right now.
+      var connectedInputUIDs: () -> [String]
+    }
+
+    struct ModelCatalog {
+      let provider: LLMProvider?
+      let models: [LLMModelInfo]
+    }
+
+    enum SetOutcome: Equatable {
+      case written(forced: Bool)
+      case refused(code: String, message: String)
+
+      /// The refusal code, or nil for a write.
+      var code: String? {
+        if case .refused(let code, _) = self { return code }
+        return nil
+      }
+
+      var message: String {
+        if case .refused(_, let message) = self { return message }
+        return ""
+      }
+    }
+
+    /// Providers whose model is a fixed literal the provider setter pins; there is no model
+    /// to choose, so an ordinary `llmModel` write is refused.
+    static let fixedModelProviders: Set<LLMProvider> = [.appleIntelligence, .egOne, .s1Mini, .none]
+
+    /// How an ordinary (non-forced) write is checked before the typed assignment.
+    enum Route: Equatable {
+      /// No check beyond decoding: the screen assigns the property directly.
+      case typed
+      /// The current provider's discovered catalog (`llmModel`).
+      case modelCatalog
+      /// `MicrophoneChoiceValidation`, then `SettingsManager.chooseInputDevice(uid:)`.
+      case inputDevice
+      /// The start-word owners on `SettingsManager`.
+      case spokenPunctuation
+      /// The check is delivered in a later PR; only `force` writes it in this build.
+      case notYetShared
+    }
+
+    /// Derived from `entry(_:)`, so membership has one authority. A `viaOwner` row with
+    /// no route here refuses rather than falling through to an unchecked assignment.
+    static func route(_ key: Key) -> Route {
+      let entry = entry(key)
+      guard entry.deferredTo == nil else { return .notYetShared }
+      switch entry.kind {
+      case .direct, .staging:
+        return key == .llmModel ? .modelCatalog : .typed
+      case .viaOwner:
+        if key == .selectedInputDeviceUID || key == .preferredInputDeviceIDOverride {
+          return .inputDevice
+        }
+        if key == .spokenPunctuation { return .spokenPunctuation }
+        if key == .hasCompletedOnboarding { return .typed }
+        return .notYetShared
+      case .extractedCheck:
+        return .notYetShared
+      }
+    }
+
+    /// A settings write as the door receives it: `force` assigns directly (any key); an
+    /// ordinary write takes the key's route first. Every refusal happens before the first
+    /// mutation.
+    static func write(
+      _ key: Key, value: Any, force: Bool, context: WriteContext, to settings: SettingsManager
+    ) -> SetOutcome {
+      attributed(settings) {
+        checkedWrite(key, value: value, force: force, context: context, to: settings)
+      }
+    }
+
+    private static func checkedWrite(
+      _ key: Key, value: Any, force: Bool, context: WriteContext, to settings: SettingsManager
+    ) -> SetOutcome {
+      if force { return outcome(forceWrite(key, value: value, to: settings)) }
+      switch route(key) {
+      case .typed:
+        return outcome(assign(key, value: value, to: settings, forced: false))
+      case .modelCatalog:
+        return writeModel(value, context: context, to: settings)
+      case .inputDevice:
+        guard let uid = Codec.string(value) else {
+          return .refused(code: "badValue", message: "wrong type or unknown value")
+        }
+        guard
+          MicrophoneChoiceValidation.isSelectable(uid: uid, connectedUIDs: context.connectedInputUIDs)
+        else {
+          return .refused(code: "checkFailed", message: "that input device is not connected")
+        }
+        settings.chooseInputDevice(uid: uid)
+        return .written(forced: false)
+      case .spokenPunctuation:
+        return writeSpokenPunctuation(value, to: settings)
+      case .notYetShared:
+        return .refused(
+          code: "checkNotYetShared",
+          message: "this setting's screen check is not shared yet; use force to stage it")
+      }
+    }
+
+    private static func outcome(_ written: WriteOutcome) -> SetOutcome {
+      switch written {
+      case .written(let forced): return .written(forced: forced)
+      case .badValue(let message): return .refused(code: "badValue", message: message)
+      }
+    }
+
+    /// The screen's model menu offers the current provider's discovered models in the
+    /// recommended, other and hosted groups and disables the locked ones
+    /// (`OllamaModelPickerPresentation.groups`); the same groups decide here.
+    private static func writeModel(
+      _ value: Any, context: WriteContext, to settings: SettingsManager
+    ) -> SetOutcome {
+      guard let id = Codec.string(value) else {
+        return .refused(code: "badValue", message: "wrong type or unknown value")
+      }
+      let provider = settings.llmProvider
+      guard !fixedModelProviders.contains(provider) else {
+        return .refused(code: "badValue", message: "the current provider has a fixed model")
+      }
+      let catalog = context.modelCatalog()
+      guard catalog.provider == provider, !catalog.models.isEmpty else {
+        return .refused(
+          code: "catalogUnavailable", message: "no discovered models for the current provider")
+      }
+      let groups = OllamaModelPickerPresentation.groups(from: catalog.models, provider: provider)
+      let offered = (groups.recommended + groups.other + groups.hosted).map(\.id)
+      guard offered.contains(id) else {
+        let locked = groups.locked.contains { $0.id == id }
+        return .refused(
+          code: "badValue",
+          message: locked ? "that model is not available with this key" : "no such model")
+      }
+      return outcome(assign(.llmModel, value: id, to: settings, forced: false))
+    }
+
+    /// An ordinary spoken-punctuation write: `enabled` is assigned directly; the override
+    /// map is the complete desired set of start words. Every entry is validated first by
+    /// the same owner that validates stored overrides at launch
+    /// (`SpokenPunctuationRules.validatedStartWords`, which drops what it refuses); if any
+    /// entry would be dropped, nothing changes. Then each entry goes through
+    /// `commitSpokenPunctuationStartWord` (normalization, sparse defaults) and each override
+    /// absent from the request through `resetSpokenPunctuationStartWord`.
+    private static func writeSpokenPunctuation(_ value: Any, to settings: SettingsManager)
+      -> SetOutcome
+    {
+      guard let candidate = Codec.spokenPunctuation(value) else {
+        return .refused(code: "badValue", message: "wrong type or unknown value")
+      }
+      let requested = candidate.startWordOverrides
+      let baseCodes = requested.keys.allSatisfy { LanguageNormalizer.baseCode($0) == $0 }
+      let validated = SpokenPunctuationRules.validatedStartWords(requested, dropDefaults: false)
+      guard baseCodes, Set(validated.keys) == Set(requested.keys) else {
+        return .refused(
+          code: "checkFailed", message: "a start word or language code was refused")
+      }
+      // A regional key can only have been staged by force; the reset owner normalizes the
+      // language and cannot find it, so a "complete set" write could not remove it.
+      guard
+        settings.spokenPunctuation.startWordOverrides.keys.allSatisfy({
+          LanguageNormalizer.baseCode($0) == $0
+        })
+      else {
+        return .refused(
+          code: "checkFailed",
+          message:
+            "stored start-word keys cannot be reset through the checked owner; use force to replace the staged map"
+        )
+      }
+      if settings.spokenPunctuation.enabled != candidate.enabled {
+        settings.spokenPunctuation.enabled = candidate.enabled
+      }
+      for language in requested.keys.sorted() {
+        settings.commitSpokenPunctuationStartWord(requested[language] ?? "", language: language)
+      }
+      for language in settings.spokenPunctuation.startWordOverrides.keys.sorted()
+      where requested[language] == nil {
+        settings.resetSpokenPunctuationStartWord(language: language)
+      }
+      return .written(forced: false)
+    }
+
+    /// The silence detector turns the timeout into a chunk count with
+    /// `Int(ceil(timeout / chunkDuration))`, which traps when the quotient is not
+    /// representable. A finite value whose count is representable is admitted even far
+    /// outside the screen's 0.5-3.0 range.
+    nonisolated static func silenceTimeoutIsConvertible(_ seconds: Double) -> Bool {
+      guard seconds.isFinite else { return false }
+      let chunkDuration = Double(SilenceDetector.chunkSize) / AudioConstants.sampleRate
+      return Int(exactly: ceil(seconds / chunkDuration)) != nil
+    }
+
+    // MARK: - JSON codec
+
+    /// Strict JSON-to-Swift decoding. Foundation's bridging casts are permissive
+    /// (`true as? Int` and `1 as? Bool` both succeed on `NSNumber`), so every number is
+    /// checked for its boolean-ness and float-ness first.
+    enum Codec {
+      static func isBoolean(_ number: NSNumber) -> Bool {
+        CFGetTypeID(number) == CFBooleanGetTypeID()
+      }
+
+      static func bool(_ value: Any) -> Bool? {
+        guard let number = value as? NSNumber, isBoolean(number) else { return nil }
+        return number.boolValue
+      }
+
+      static func string(_ value: Any) -> String? { value as? String }
+
+      static func double(_ value: Any) -> Double? {
+        guard let number = value as? NSNumber, !isBoolean(number) else { return nil }
+        let double = number.doubleValue
+        return double.isFinite ? double : nil
+      }
+
+      static func float(_ value: Any) -> Float? {
+        guard let double = double(value) else { return nil }
+        let float = Float(double)
+        return float.isFinite ? float : nil
+      }
+
+      /// The JSON number as exactly `T`, or nil when it is a boolean, has a fraction, or is
+      /// out of `T`'s range. Decoding the number's own JSON text with `JSONDecoder` gives
+      /// exact range checks: `int64Value` on an unsigned 64-bit number silently wraps.
+      static func exactInteger<T: FixedWidthInteger & Decodable>(_ value: Any, _: T.Type) -> T? {
+        guard let number = value as? NSNumber, !isBoolean(number),
+          let data = try? JSONSerialization.data(withJSONObject: number, options: .fragmentsAllowed)
+        else { return nil }
+        return try? JSONDecoder().decode(T.self, from: data)
+      }
+
+      static func uint16(_ value: Any) -> UInt16? {
+        exactInteger(value, UInt16.self)
+      }
+
+      static func modifiers(_ value: Any) -> NSEvent.ModifierFlags? {
+        exactInteger(value, UInt.self).map { NSEvent.ModifierFlags(rawValue: $0) }
+      }
+
+      static func raw<E: RawRepresentable>(_ value: Any, _: E.Type) -> E?
+      where E.RawValue == String {
+        (value as? String).flatMap(E.init(rawValue:))
+      }
+
+      /// `null` clears; a string must name a case. Returned double-wrapped so `set` can
+      /// tell "decoded to nil" from "did not decode".
+      static func optionalRaw<E: RawRepresentable>(_ value: Any, _: E.Type) -> E??
+      where E.RawValue == String {
+        if value is NSNull { return .some(nil) }
+        guard let decoded = raw(value, E.self) else { return nil }
+        return .some(decoded)
+      }
+
+      /// `{"mode":"auto"}` or `{"mode":"locked","code":"<language code>"}`, the shape
+      /// `LanguageMode` persists.
+      static func languageMode(_ value: Any) -> LanguageMode? {
+        guard let object = value as? [String: Any], let mode = object["mode"] as? String else {
+          return nil
+        }
+        switch mode {
+        case "auto":
+          return object.count == 1 ? .auto : nil
+        case "locked":
+          guard object.count == 2, let code = object["code"] as? String else {
+            return nil
+          }
+          return .locked(code)
+        default:
+          return nil
+        }
+      }
+
+      static func encode(_ mode: LanguageMode) -> [String: Any] {
+        switch mode {
+        case .auto: return ["mode": "auto"]
+        case .locked(let code): return ["mode": "locked", "code": code]
+        }
+      }
+
+      /// `{"enabled": Bool, "startWordOverrides": {language: word}}`.
+      static func spokenPunctuation(_ value: Any) -> SpokenPunctuationSettings? {
+        guard let object = value as? [String: Any], object.count == 2,
+          let enabledValue = object["enabled"], let enabled = bool(enabledValue),
+          let overrides = object["startWordOverrides"] as? [String: Any]
+        else { return nil }
+        var words: [String: String] = [:]
+        for (language, word) in overrides {
+          guard let word = word as? String else { return nil }
+          words[language] = word
+        }
+        return SpokenPunctuationSettings(enabled: enabled, startWordOverrides: words)
+      }
+
+      static func encode(_ settings: SpokenPunctuationSettings) -> [String: Any] {
+        ["enabled": settings.enabled, "startWordOverrides": settings.startWordOverrides]
+      }
+
+      /// `{deviceUID: channel}` with integer channels.
+      static func channelMap(_ value: Any) -> [String: Int]? {
+        guard let object = value as? [String: Any] else { return nil }
+        var map: [String: Int] = [:]
+        for (uid, channel) in object {
+          guard let channel = exactInteger(channel, Int.self) else { return nil }
+          map[uid] = channel
+        }
+        return map
+      }
+    }
+  }
+#endif
