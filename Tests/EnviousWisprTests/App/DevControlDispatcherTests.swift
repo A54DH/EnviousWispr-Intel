@@ -1,4 +1,5 @@
 #if DEBUG
+  import AppKit
   import EnviousWisprASR
   import EnviousWisprCore
   import EnviousWisprModelDelivery
@@ -27,7 +28,8 @@
         settings: settings,
         writeContext: DevControlSettings.WriteContext(
           modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-          connectedInputUIDs: { ["mic-a"] }, pillWordsCapability: { .available }),
+          loadCachedModelCatalog: { _, _ in },
+          connectedInputUIDs: { ["mic-a"] }, inputChannelCounts: { [:] }, pillWordsCapability: { .available }),
         status: DevControlFixtures.StatusFake().sources,
         history: DevControlFixtures.history([]),
         models: DevControlFixtures.ModelFake().actions,
@@ -123,22 +125,117 @@
       #expect(settings.fillerRemovalEnabled == !target)
     }
 
-    @Test("a deferred key refuses an ordinary write and accepts a forced one")
-    func deferredKeyThroughDispatch() async throws {
+    @Test("channel.set validates its arguments, then reads back the input the row shows")
+    func channelSetThroughDispatch() async throws {
+      let defaults = TestDefaults.suite("ew.tests.3765.dispatch.\(UUID().uuidString)")!
+      let settings = SettingsManager(defaults: defaults)
+      let dispatcher = DevControlDispatcher(
+        settings: settings,
+        writeContext: DevControlSettings.WriteContext(
+          modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
+          loadCachedModelCatalog: { _, _ in },
+          connectedInputUIDs: { [] }, inputChannelCounts: { ["mic-a": 4] },
+          pillWordsCapability: { .available }),
+        status: DevControlFixtures.StatusFake().sources,
+        history: DevControlFixtures.history([]),
+        models: DevControlFixtures.ModelFake().actions,
+        dictation: DevControlFixtures.inertDictation(),
+        credentials: DevControlFixtures.isolatedCredentials(),
+        words: DevControlFixtures.unwrittenWords())
+      let reply = try #require(payload(await dispatcher.handle(
+        .channelSet, args: ["deviceUID": "mic-a", "channel": NSNumber(value: 2)])))
+      #expect(reply["deviceUID"] as? String == "mic-a")
+      #expect(reply["channel"] as? Int == 2)
+      for args: [String: Any] in [
+        ["deviceUID": "mic-a"], ["channel": 1], ["deviceUID": "", "channel": 1],
+        ["deviceUID": "mic-a", "channel": true], ["deviceUID": "mic-a", "channel": 1.5],
+        ["deviceUID": "mic-a", "channel": "1"], ["deviceUID": "mic-a", "channel": 1, "x": 1],
+      ] {
+        #expect(code(await dispatcher.handle(.channelSet, args: args)) == "badArgs", "\(args)")
+      }
+      #expect(code(await dispatcher.handle(
+        .channelSet, args: ["deviceUID": "mic-a", "channel": 9])) == "checkFailed")
+      #expect(settings.inputChannelByDeviceUID == ["mic-a": 2])
+    }
+
+    @Test("shortcut.set saves a whole shortcut and reads both halves back")
+    func shortcutSetThroughDispatch() async throws {
       let (settings, dispatcher) = Self.make()
-      let before = settings.toggleKeyCode
-      let target: UInt16 = before == 12 ? 13 : 12
+      let reply = await dispatcher.handle(
+        .shortcutSet,
+        args: [
+          "role": "record", "keyCode": NSNumber(value: ModifierKeyCodes.rightCommand),
+          "modifiers": NSNumber(value: NSEvent.ModifierFlags.command.rawValue),
+        ])
+      guard case .ok(let payload, let forced) = reply else {
+        Issue.record("not ok: \(reply)")
+        return
+      }
+      #expect(forced == false)
+      #expect(payload["role"] as? String == "record")
+      #expect(payload["keyCode"] as? Int == Int(ModifierKeyCodes.rightCommand))
+      #expect(payload["modifiers"] as? UInt == 0, "a lone modifier stores no modifiers")
+      #expect(settings.toggleKeyCode == ModifierKeyCodes.rightCommand)
+
+      // F2, F8, F9 and F5 with Control-Shift: no default and no Mac shortcut uses them.
+      for (role, keyCode) in [("cancel", 120), ("quickAdd", 100), ("pasteLast", 101), ("copyLast", 96)] {
+        let saved = await dispatcher.handle(
+          .shortcutSet,
+          args: [
+            "role": role, "keyCode": keyCode,
+            "modifiers": NSNumber(value: NSEvent.ModifierFlags([.control, .shift]).rawValue),
+          ])
+        #expect(code(saved) == nil, "\(role)")
+      }
+      #expect(settings.cancelKeyCode == 120 && settings.copyLastKeyCode == 96)
+      #expect(settings.copyLastModifiers == [.control, .shift])
+    }
+
+    @Test("shortcut.set refuses malformed arguments and clashes without changing anything")
+    func shortcutSetRefusals() async throws {
+      let (settings, dispatcher) = Self.make()
+      let before = settings.shortcutBindings
+      let control = NSEvent.ModifierFlags.control.rawValue
+      for args: [String: Any] in [
+        [:],
+        ["role": "toggle", "keyCode": 1, "modifiers": control],
+        ["role": "record", "keyCode": 1],
+        ["role": "record", "keyCode": 1, "modifiers": control, "force": true],
+        ["role": 1, "keyCode": 1, "modifiers": control],
+        ["role": "record", "keyCode": true, "modifiers": control],
+        ["role": "record", "keyCode": 1.5, "modifiers": control],
+        ["role": "record", "keyCode": 65536, "modifiers": control],
+        ["role": "record", "keyCode": -1, "modifiers": control],
+        ["role": "record", "keyCode": "1", "modifiers": control],
+        ["role": "record", "keyCode": 1, "modifiers": -1],
+        ["role": "record", "keyCode": 1, "modifiers": false],
+      ] {
+        #expect(code(await dispatcher.handle(.shortcutSet, args: args)) == "badArgs", "\(args)")
+      }
       #expect(
-        code(
-          await dispatcher.handle(
-            .settingsSet, args: ["key": "toggleKeyCode", "value": NSNumber(value: target)]))
-          == "checkNotYetShared")
-      #expect(settings.toggleKeyCode == before)
+        code(await dispatcher.handle(
+          .shortcutSet,
+          args: ["role": "quickAdd", "keyCode": 8,
+                 "modifiers": NSNumber(value: NSEvent.ModifierFlags.command.rawValue)]))
+          == "checkFailed")
+      #expect(
+        code(await dispatcher.handle(
+          .shortcutSet, args: ["role": "record", "keyCode": 53, "modifiers": 0]))
+          == "checkFailed")
+      #expect(settings.shortcutBindings == before)
+    }
+
+    @Test("a single shortcut field is checked whole; force stages it")
+    func shortcutFieldThroughDispatch() async throws {
+      let (settings, dispatcher) = Self.make()
+      #expect(
+        code(await dispatcher.handle(
+          .settingsSet, args: ["key": "toggleKeyCode", "value": 53])) == "checkFailed")
+      #expect(settings.toggleKeyCode == ShortcutRole.record.defaultKeyCode)
       let forced = await dispatcher.handle(
-        .settingsSet,
-        args: ["key": "toggleKeyCode", "value": NSNumber(value: target), "force": true])
+        .settingsSet, args: ["key": "toggleKeyCode", "value": 53, "force": true])
       #expect(forcedFlag(forced) == true)
-      #expect(settings.toggleKeyCode == target)
+      #expect(settings.toggleKeyCode == 53)
     }
 
     @Test("every refusal code the dispatcher returns is in the closed vocabulary")
@@ -151,7 +248,8 @@
         await dispatcher.handle(.settingsGet, args: ["key": "nope"]),
         await dispatcher.handle(.settingsSet, args: ["key": "llmModel", "value": 3]),
         await dispatcher.handle(.settingsSet, args: ["key": "llmModel", "value": "gpt-x"]),
-        await dispatcher.handle(.settingsSet, args: ["key": "toggleKeyCode", "value": 1]),
+        await dispatcher.handle(.settingsSet, args: ["key": "toggleKeyCode", "value": 53]),
+        await dispatcher.handle(.shortcutSet, args: ["role": "nope"]),
         await dispatcher.handle(
           .settingsSet, args: ["key": "selectedInputDeviceUID", "value": "mic-z"]),
       ]
@@ -232,7 +330,8 @@
         settings: settings,
         writeContext: DevControlSettings.WriteContext(
           modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-          connectedInputUIDs: { [] }, pillWordsCapability: { .available }),
+          loadCachedModelCatalog: { _, _ in },
+          connectedInputUIDs: { [] }, inputChannelCounts: { [:] }, pillWordsCapability: { .available }),
         status: status.sources,
         history: DevControlDispatcher.HistorySource(visibleTranscripts: rows),
         models: models.actions,
@@ -571,7 +670,8 @@ private static func make(words: CustomWordsCoordinator) -> (SettingsManager, Dev
     settings: settings,
     writeContext: DevControlSettings.WriteContext(
       modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-      connectedInputUIDs: { [] }, pillWordsCapability: { .available }),
+      loadCachedModelCatalog: { _, _ in },
+      connectedInputUIDs: { [] }, inputChannelCounts: { [:] }, pillWordsCapability: { .available }),
     status: DevControlFixtures.StatusFake().sources,
     history: DevControlFixtures.history([]),
     models: DevControlFixtures.ModelFake().actions,

@@ -165,19 +165,25 @@ struct KeybindRowDefaultsTests {
 
   @Test("Every row binds its own setting, so no shortcut is edited from two rows")
   func everyRowBindsItsOwnSetting() throws {
-    // The one property the type system does not carry. A row's ROLE now decides its Reset default,
-    // but nothing links that role to the settings binding beside it, so a row can still be given
-    // `.quickAdd` and wired to `$settings.cancelKeyCode`.
-    for (role, setting) in [
-      ("record", "toggle"), ("cancel", "cancel"),
-      ("quickAdd", "quickAdd"),
-      ("pasteLast", "pasteLast"),
-      ("copyLast", "copyLast"),
-    ] {
+    // #3765 PR-C: a row's ROLE now decides its two settings too, through
+    // `ShortcutSettings.keyCodeField(for:)` and `modifiersField(for:)`, which
+    // `ShortcutSettingsTests` checks for all five roles. What is left for source text: no row is
+    // handed a setting beside its role, which would put a second, unchecked link back.
+    for role in ["record", "cancel", "quickAdd", "pasteLast", "copyLast"] {
       let block = try Self.rowBlock(role: role)
       #expect(block.contains("role: .\(role)"))
-      #expect(block.contains("keyCode: $settings.\(setting)KeyCode"))
-      #expect(block.contains("modifiers: $settings.\(setting)Modifiers"))
+      #expect(block.contains("$settings") == false, "\(role): \(block)")
+      #expect(block.contains("keyCode:") == false && block.contains("modifiers:") == false)
+    }
+    // And the row asks for exactly its OWN role's fields: a lookup fixed to one role would make
+    // every row edit that role's shortcut, with the owner itself still correct.
+    let tree = Parser.parse(source: try Self.executableSource())
+    for field in ["keyCode", "modifiers"] {
+      let calls = MicrophoneSettingsWiringTests.calls(
+        named: "ShortcutSettings.\(field)Field", in: tree)
+      #expect(calls.count == 2, "\(field): \(calls)")
+      #expect(
+        calls.allSatisfy { $0.arguments == ["role"] && $0.bindings == [field] }, "\(calls)")
     }
   }
 

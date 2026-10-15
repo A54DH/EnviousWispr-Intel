@@ -1,4 +1,5 @@
 #if DEBUG
+  import AppKit
   import EnviousWisprASR
   import EnviousWisprCore
   import EnviousWisprModelDelivery
@@ -20,6 +21,8 @@
       case settingsGet = "settings.get"
       case settingsSet = "settings.set"
       case languageSet = "language.set"
+      case channelSet = "channel.set"
+      case shortcutSet = "shortcut.set"
       case keysSet = "keys.set"
       case keysClear = "keys.clear"
       case status
@@ -45,7 +48,6 @@
       case badArgs
       case badValue
       case checkFailed
-      case checkNotYetShared
       case catalogUnavailable
       case notFound
       /// The word owner refused the change; the reply carries its own message.
@@ -178,6 +180,10 @@
         return set(args)
       case .languageSet:
         return setLanguage(args)
+      case .channelSet:
+        return setChannel(args)
+      case .shortcutSet:
+        return setShortcut(args)
       case .keysSet:
         return setKey(args)
       case .keysClear:
@@ -238,7 +244,6 @@
         "key": entry.name,
         "value": DevControlSettings.read(key, from: settings),
         "kind": entry.kind.rawValue,
-        "deferredTo": entry.deferredTo.map { $0 as Any } ?? NSNull(),
         "legacy": entry.legacy,
       ]
     }
@@ -285,6 +290,62 @@
         return .ok([
           "languageMode": DevControlSettings.read(.languageMode, from: settings),
           "englishSpelling": DevControlSettings.read(.englishSpelling, from: settings),
+        ])
+      case .refused(let code, let message):
+        return .error(
+          code: ErrorCode(rawValue: code)?.rawValue ?? ErrorCode.badValue.rawValue, message: message
+        )
+      }
+    }
+
+    /// `{deviceUID, channel}`: a zero-based input of one connected device. The reply reads
+    /// back the input the row shows for that device afterwards.
+    private func setChannel(_ args: [String: Any]) -> Result {
+      guard Set(args.keys) == ["deviceUID", "channel"],
+        let uid = args["deviceUID"] as? String, !uid.isEmpty,
+        let raw = args["channel"], let channel = DevControlSettings.Codec.exactInteger(raw, Int.self)
+      else {
+        return .failure(.badArgs, "channel.set takes deviceUID (a string) and channel (an integer)")
+      }
+      switch DevControlSettings.setChannel(channel, for: uid, context: writeContext, to: settings) {
+      case .written:
+        let count = writeContext.inputChannelCounts()[uid] ?? 0
+        return .ok([
+          "deviceUID": uid,
+          "channel": InputChannelSettings.selection(
+            for: uid, inputChannelCount: count, in: settings.inputChannelByDeviceUID),
+        ])
+      case .refused(let code, let message):
+        return .error(
+          code: ErrorCode(rawValue: code)?.rawValue ?? ErrorCode.badValue.rawValue, message: message
+        )
+      }
+    }
+
+    /// `{role, keyCode, modifiers}`: a Keybinds row's whole shortcut. `role` is a
+    /// `ShortcutRole` raw value (`record`, `cancel`, `quickAdd`, `pasteLast`, `copyLast`;
+    /// recording is stored as the `toggle` pair); `modifiers` is the `NSEvent.ModifierFlags`
+    /// raw value. The reply reads both stored halves back, so it shows what was saved.
+    private func setShortcut(_ args: [String: Any]) -> Result {
+      guard Set(args.keys) == ["role", "keyCode", "modifiers"],
+        let role = (args["role"] as? String).flatMap(ShortcutRole.init(rawValue:)),
+        let rawKeyCode = args["keyCode"],
+        let keyCode = DevControlSettings.Codec.uint16(rawKeyCode),
+        let rawModifiers = args["modifiers"],
+        let modifiers = DevControlSettings.Codec.modifiers(rawModifiers)
+      else {
+        return .failure(
+          .badArgs,
+          "shortcut.set takes role (record, cancel, quickAdd, pasteLast or copyLast), keyCode "
+            + "(0 to 65535) and modifiers (a modifier-flags integer)")
+      }
+      switch DevControlSettings.setShortcut(role, keyCode: keyCode, modifiers: modifiers, to: settings)
+      {
+      case .written:
+        return .ok([
+          "role": role.rawValue,
+          "keyCode": Int(settings[keyPath: ShortcutSettings.keyCodeField(for: role)]),
+          "modifiers": settings[keyPath: ShortcutSettings.modifiersField(for: role)].rawValue,
         ])
       case .refused(let code, let message):
         return .error(

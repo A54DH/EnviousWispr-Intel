@@ -7,9 +7,9 @@
 
   /// #3765: the dev control door's table of every `SettingsManager.SettingKey`.
   ///
-  /// Three switches over `SettingKey`, none with a `default`, so a new setting does not
-  /// compile in a DEBUG build until it is placed in a kind, given a JSON reading, and given
-  /// a typed forced assignment. `allKeys` is the list the door exposes; a test compares it
+  /// Four switches over `SettingKey`, none with a `default`, so a new setting does not
+  /// compile in a DEBUG build until it is placed in a kind, given an ordinary route, given a
+  /// JSON reading, and given a typed forced assignment. `allKeys` is the list the door exposes; a test compares it
   /// with the enum's declaration in source, because an exhaustive switch cannot notice a
   /// case that is missing from a list.
   ///
@@ -28,7 +28,7 @@
       case direct
       /// The screen goes through an owner's helper with its preconditions.
       case viaOwner
-      /// The screen's check lives in a view today; PR-C moves it into a shared owner.
+      /// The screen's check, moved out of its view into a shared owner the door also calls.
       case extractedCheck
       /// No current screen operation writes it, or it is legacy; type checks only.
       case staging
@@ -38,8 +38,6 @@
       let key: Key
       let name: String
       let kind: Kind
-      /// The PR that delivers the non-forced route, or nil when it exists in this build.
-      let deferredTo: String?
       let legacy: Bool
     }
 
@@ -80,8 +78,8 @@
     // MARK: - Membership
 
     static func entry(_ key: Key) -> Entry {
-      func make(_ kind: Kind, deferredTo: String? = nil, legacy: Bool = false) -> Entry {
-        Entry(key: key, name: name(key), kind: kind, deferredTo: deferredTo, legacy: legacy)
+      func make(_ kind: Kind, legacy: Bool = false) -> Entry {
+        Entry(key: key, name: name(key), kind: kind, legacy: legacy)
       }
       switch key {
       case .selectedBackend, .recordingMode, .llmProvider, .llmModel, .s1MiniStyling,
@@ -101,9 +99,9 @@
         return make(.viaOwner)
       case .cancelKeyCode, .cancelModifiers, .quickAddKeyCode, .quickAddModifiers,
         .pasteLastKeyCode, .pasteLastModifiers, .copyLastKeyCode, .copyLastModifiers,
-        .toggleKeyCode, .toggleModifiers, .fileImportLLMProvider, .fileImportLLMModel,
-        .fileImportOllamaModel, .ollamaModel, .vadSilenceTimeout, .inputChannelByDeviceUID:
-        return make(.extractedCheck, deferredTo: "PR-C")
+        .toggleKeyCode, .toggleModifiers, .vadSilenceTimeout, .fileImportLLMProvider,
+        .fileImportLLMModel, .fileImportOllamaModel, .ollamaModel, .inputChannelByDeviceUID:
+        return make(.extractedCheck)
       case .hotkeyEnabled, .vadSensitivity, .vadEnergyGate, .crashRecoveryEnabled,
         .onboardingState:
         return make(.staging)
@@ -200,7 +198,6 @@
           "key": entry.name,
           "value": read(key, from: settings),
           "kind": entry.kind.rawValue,
-          "deferredTo": entry.deferredTo.map { $0 as Any } ?? NSNull(),
           "legacy": entry.legacy,
         ]
       }
@@ -406,8 +403,14 @@
     struct WriteContext {
       /// The polish model catalog discovery currently holds, and the provider it is about.
       var modelCatalog: () -> ModelCatalog
+      /// The screen's synchronous cached load, including ownership and surface repair
+      /// (`LLMModelDiscoveryCoordinator.loadCachedModels`), so a model check after a provider
+      /// change does not depend on a mounted screen.
+      var loadCachedModelCatalog: (LLMProvider, ProviderSetupSurface) -> Void
       /// UIDs of the input devices the system lists right now.
       var connectedInputUIDs: () -> [String]
+      /// Input count per connected input device UID, read at request time.
+      var inputChannelCounts: () -> [String: Int]
       /// Whether the pill can show words right now, as the Appearance picker reads it
       /// (`PillAppearanceModel.wordsCapability`).
       var pillWordsCapability: () -> PillWordsCapability
@@ -451,40 +454,76 @@
       /// The Appearance pill picker: its group for the slot, `offersCoupled`, then
       /// `PillAppearanceModel.chooseCoupled`.
       case pillDesign
+      /// The pause-duration slider's offered values (`SilenceTimeoutSlider`).
+      case silenceTimeout
+      /// Transcribe a File's provider picker (`PolishSettings.setProvider` on `.fileImport`);
+      /// `null` is "Use dictation's polish settings".
+      case importProvider
+      /// Transcribe a File's model menu, through the same offered-model groups as llmModel.
+      case importModel
+      /// An Ollama model pick on the surface the field belongs to, allowed only while that
+      /// surface's provider is Ollama; the pick goes through the model menu's own write.
+      case ollamaModel
+      /// The socket row picks one device's input at a time, against that device's inputs, so
+      /// a whole-map write is refused toward `channel.set` (`setChannel`).
+      case channelCommand
       /// The language picker sets the lock and the spelling together, so a single-field
       /// write is refused toward `language.set` (`setLanguage`).
       case languageCommand
-      /// The check is delivered in a later PR; only `force` writes it in this build.
-      case notYetShared
+      /// One half of a Keybinds shortcut: checked as the whole binding it makes with the other
+      /// half as saved (`setShortcut`); `shortcut.set` changes both halves together.
+      case shortcutField
     }
 
-    /// Derived from `entry(_:)`, so membership has one authority. A `viaOwner` row with
-    /// no route here refuses rather than falling through to an unchecked assignment.
+    /// One case per key and no `default`, so a new setting cannot compile without a route.
+    /// The typed keys are the `direct` and `staging` rows plus `hasCompletedOnboarding`, whose
+    /// owner is a plain assignment; `DevControlSettingsTests` checks this against `entry(_:)`.
     static func route(_ key: Key) -> Route {
-      let entry = entry(key)
-      guard entry.deferredTo == nil else { return .notYetShared }
-      switch entry.kind {
-      case .direct, .staging:
-        return key == .llmModel ? .modelCatalog : .typed
-      case .viaOwner:
-        if key == .selectedInputDeviceUID || key == .preferredInputDeviceIDOverride {
-          return .inputDevice
-        }
-        if key == .spokenPunctuation { return .spokenPunctuation }
-        if key == .recordingPillDesignWithoutWords || key == .recordingPillDesignWithWords {
-          return .pillDesign
-        }
-        if key == .languageMode || key == .englishSpelling { return .languageCommand }
-        if key == .hasCompletedOnboarding { return .typed }
-        return .notYetShared
-      case .extractedCheck:
-        return .notYetShared
+      switch key {
+      case .llmModel:
+        return .modelCatalog
+      case .selectedInputDeviceUID, .preferredInputDeviceIDOverride:
+        return .inputDevice
+      case .spokenPunctuation:
+        return .spokenPunctuation
+      case .recordingPillDesignWithoutWords, .recordingPillDesignWithWords:
+        return .pillDesign
+      case .languageMode, .englishSpelling:
+        return .languageCommand
+      case .vadSilenceTimeout:
+        return .silenceTimeout
+      case .fileImportLLMProvider:
+        return .importProvider
+      case .fileImportLLMModel:
+        return .importModel
+      case .ollamaModel, .fileImportOllamaModel:
+        return .ollamaModel
+      case .inputChannelByDeviceUID:
+        return .channelCommand
+      case .cancelKeyCode, .cancelModifiers, .quickAddKeyCode, .quickAddModifiers,
+        .pasteLastKeyCode, .pasteLastModifiers, .copyLastKeyCode, .copyLastModifiers,
+        .toggleKeyCode, .toggleModifiers:
+        return .shortcutField
+      case .selectedBackend, .recordingMode, .llmProvider, .s1MiniStyling, .s1MiniStructure,
+        .s1MiniContext, .autoCopyToClipboard, .hotkeyEnabled, .vadAutoStop, .vadSensitivity,
+        .vadEnergyGate, .onboardingState, .hasCompletedOnboarding, .pushToTalkKeyCode,
+        .pushToTalkModifiers, .modelUnloadPolicy, .restoreClipboardAfterPaste,
+        .keepDictationsOutOfClipboardHistory, .quickAddClipboardFallback, .smartInsertion,
+        .escapeRecoveryEnabled, .wordCorrectionEnabled, .fillerRemovalEnabled,
+        .emojiFormatterEnabled, .casualModeEnabled, .crashRecoveryEnabled, .shareUsageMetrics,
+        .sendCrashReports, .contactsSyncOnLaunchEnabled, .isDebugModeEnabled,
+        .isDictationAudioArchiveEnabled, .debugLogLevel, .whisperKitLanguage, .useStreamingASR,
+        .livePreviewEnabled, .livePreviewEngine, .warmEnginePolicy, .appearance,
+        .overlayPillPosition, .showBluetoothTips, .showInDock, .showMenuBarUpdateAlert,
+        .playRecordingSounds, .recordingSoundPairing, .otherAudioWhileDictating, .learnFromEdits:
+        return .typed
       }
     }
 
     /// A settings write as the door receives it: `force` assigns directly (any key); an
     /// ordinary write takes the key's route first. Every refusal happens before the first
-    /// mutation.
+    /// mutation, except that a model check may first load the cached catalog and run its
+    /// surface repair, which stays applied even if the requested model is then refused.
     static func write(
       _ key: Key, value: Any, force: Bool, context: WriteContext, to settings: SettingsManager
     ) -> SetOutcome {
@@ -501,7 +540,27 @@
       case .typed:
         return outcome(assign(key, value: value, to: settings, forced: false))
       case .modelCatalog:
-        return writeModel(value, context: context, to: settings)
+        return writeModel(value, surface: .dictation, context: context, to: settings)
+      case .importProvider:
+        if value is NSNull {
+          settings.followDictationForFileImportPolish()
+          return .written(forced: false)
+        }
+        guard let provider = Codec.raw(value, LLMProvider.self) else {
+          return .refused(code: "badValue", message: "wrong type or unknown value")
+        }
+        PolishSettings.setProvider(provider, on: .fileImport, in: settings)
+        return .written(forced: false)
+      case .importModel:
+        return writeModel(value, surface: .fileImport, context: context, to: settings)
+      case .ollamaModel:
+        let surface: ProviderSetupSurface = key == .ollamaModel ? .dictation : .fileImport
+        guard PolishSettings.provider(on: surface, in: settings) == .ollama else {
+          return .refused(
+            code: "checkFailed",
+            message: "that screen's provider is not Ollama; pick Ollama first, or use force to stage the field")
+        }
+        return writeModel(value, surface: surface, context: context, to: settings)
       case .inputDevice:
         guard let uid = Codec.string(value) else {
           return .refused(code: "badValue", message: "wrong type or unknown value")
@@ -519,15 +578,101 @@
         return writePillDesign(
           value, holdingWords: key == .recordingPillDesignWithWords, context: context,
           to: settings)
+      case .silenceTimeout:
+        guard let seconds = Codec.double(value) else {
+          return .refused(code: "badValue", message: "wrong type or unknown value")
+        }
+        guard Self.silenceTimeoutIsConvertible(seconds) else {
+          return .refused(
+            code: "badValue",
+            message: "silence timeout too large for the detector's chunk count")
+        }
+        guard SilenceTimeoutSlider.offers(seconds) else {
+          return .refused(
+            code: "checkFailed",
+            message: "the pause slider offers 0.5 to 3.0 seconds in 0.25 steps; use force to stage another value")
+        }
+        return outcome(assign(key, value: value, to: settings, forced: false))
+      case .channelCommand:
+        return .refused(
+          code: "checkFailed",
+          message: "the input-socket row sets one device's input at a time; use channel.set, "
+            + "or force to stage the whole map")
       case .languageCommand:
         return .refused(
           code: "checkFailed",
           message: "the language picker sets the lock and the spelling together; use "
             + "language.set, or force to stage this field alone")
-      case .notYetShared:
-        return .refused(
-          code: "checkNotYetShared",
-          message: "this setting's screen check is not shared yet; use force to stage it")
+      case .shortcutField:
+        return writeShortcutField(key, value: value, to: settings)
+      }
+    }
+
+    /// The Keybinds role a shortcut field belongs to, and whether it is the key-code half.
+    /// `DevControlSettingsTests` checks every answer against `ShortcutSettings`' field paths.
+    static func shortcutField(_ key: Key) -> (role: ShortcutRole, isKeyCode: Bool)? {
+      switch key {
+      case .toggleKeyCode: return (.record, true)
+      case .toggleModifiers: return (.record, false)
+      case .cancelKeyCode: return (.cancel, true)
+      case .cancelModifiers: return (.cancel, false)
+      case .quickAddKeyCode: return (.quickAdd, true)
+      case .quickAddModifiers: return (.quickAdd, false)
+      case .pasteLastKeyCode: return (.pasteLast, true)
+      case .pasteLastModifiers: return (.pasteLast, false)
+      case .copyLastKeyCode: return (.copyLast, true)
+      case .copyLastModifiers: return (.copyLast, false)
+      default: return nil
+      }
+    }
+
+    /// `shortcut.set`: a Keybinds row's whole shortcut, read the way the screen stores a key
+    /// (`ShortcutSettings.binding(keyCode:modifiers:)`), then saved through the screen's own
+    /// check and write (`ShortcutSettings.assign`). Never claims the Globe guidance, which only
+    /// the screen that shows it may take.
+    static func setShortcut(
+      _ role: ShortcutRole, keyCode: UInt16, modifiers: NSEvent.ModifierFlags,
+      to settings: SettingsManager
+    ) -> SetOutcome {
+      let candidate = ShortcutSettings.binding(keyCode: keyCode, modifiers: modifiers)
+      let refusal = attributed(settings) {
+        ShortcutSettings.assign(candidate, to: role, in: settings)
+      }
+      guard let refusal else { return .written(forced: false) }
+      return .refused(code: "checkFailed", message: message(for: refusal))
+    }
+
+    /// One half on its own: the other half stays as saved, and the pair is checked whole.
+    private static func writeShortcutField(_ key: Key, value: Any, to settings: SettingsManager)
+      -> SetOutcome
+    {
+      guard let field = shortcutField(key) else {
+        return .refused(code: "badValue", message: "not a Keybinds shortcut field")
+      }
+      var keyCode = settings[keyPath: ShortcutSettings.keyCodeField(for: field.role)]
+      var modifiers = settings[keyPath: ShortcutSettings.modifiersField(for: field.role)]
+      if field.isKeyCode {
+        guard let decoded = Codec.uint16(value) else {
+          return .refused(code: "badValue", message: "wrong type or unknown value")
+        }
+        keyCode = decoded
+      } else {
+        guard let decoded = Codec.modifiers(value) else {
+          return .refused(code: "badValue", message: "wrong type or unknown value")
+        }
+        modifiers = decoded
+      }
+      return setShortcut(field.role, keyCode: keyCode, modifiers: modifiers, to: settings)
+    }
+
+    private static func message(for refusal: ShortcutRefusal) -> String {
+      switch refusal {
+      case .systemShortcut:
+        return "the Keybinds screen refuses a standard Mac shortcut"
+      case .sameAs(let other):
+        return "the \(other.rawValue) shortcut already uses those keys"
+      case .modifierConflict(let other):
+        return "clashes with the \(other.rawValue) shortcut: one needs a key the other uses on its own"
       }
     }
 
@@ -557,6 +702,27 @@
           message: "the pill picker does not offer that design right now (\(capability))")
       }
       model.chooseCoupled(design)
+      return .written(forced: false)
+    }
+
+    /// `channel.set`: the Audio screen's input-socket pick for one CONNECTED device, offered
+    /// only when that device has a readable UID and more than one input
+    /// (`InputChannelSettings`), and only an input it has. Other devices' saved inputs are
+    /// untouched and no device is selected. The screen shows the row for the device in use;
+    /// the door can stage any connected multi-input device.
+    static func setChannel(
+      _ channel: Int, for uid: String, context: WriteContext, to settings: SettingsManager
+    ) -> SetOutcome {
+      guard let count = context.inputChannelCounts()[uid] else {
+        return .refused(code: "checkFailed", message: "no connected input device has that UID")
+      }
+      guard InputChannelSettings.offersChoice(uid: uid, inputChannelCount: count) else {
+        return .refused(code: "checkFailed", message: "that device has one input; the row is not offered")
+      }
+      guard InputChannelSettings.offers(channel, inputChannelCount: count) else {
+        return .refused(code: "checkFailed", message: "that device has inputs 0 to \(count - 1)")
+      }
+      attributed(settings) { InputChannelSettings.choose(channel, for: uid, in: settings) }
       return .written(forced: false)
     }
 
@@ -595,23 +761,31 @@
       }
     }
 
-    /// The screen's model menu offers the current provider's discovered models in the
+    /// The screen's model menu offers the surface's provider's discovered models in the
     /// recommended, other and hosted groups and disables the locked ones
-    /// (`OllamaModelPickerPresentation.groups`); the same groups decide here.
+    /// (`OllamaModelPickerPresentation.groups`); the same groups decide here, and the pick
+    /// is written the way the menu writes it (`PolishSettings.setCloudModel`).
     private static func writeModel(
-      _ value: Any, context: WriteContext, to settings: SettingsManager
+      _ value: Any, surface: ProviderSetupSurface, context: WriteContext,
+      to settings: SettingsManager
     ) -> SetOutcome {
       guard let id = Codec.string(value) else {
         return .refused(code: "badValue", message: "wrong type or unknown value")
       }
-      let provider = settings.llmProvider
+      let provider = PolishSettings.provider(on: surface, in: settings)
       guard !fixedModelProviders.contains(provider) else {
         return .refused(code: "badValue", message: "the current provider has a fixed model")
       }
-      let catalog = context.modelCatalog()
+      var catalog = context.modelCatalog()
+      if catalog.provider != provider || catalog.models.isEmpty {
+        context.loadCachedModelCatalog(provider, surface)
+        catalog = context.modelCatalog()
+      }
       guard catalog.provider == provider, !catalog.models.isEmpty else {
         return .refused(
-          code: "catalogUnavailable", message: "no discovered models for the current provider")
+          code: "catalogUnavailable",
+          message:
+            "no usable cached model catalog for the current provider; discover its models in the app first, then retry")
       }
       let groups = OllamaModelPickerPresentation.groups(from: catalog.models, provider: provider)
       let offered = (groups.recommended + groups.other + groups.hosted).map(\.id)
@@ -621,7 +795,8 @@
           code: "badValue",
           message: locked ? "that model is not available with this key" : "no such model")
       }
-      return outcome(assign(.llmModel, value: id, to: settings, forced: false))
+      PolishSettings.setCloudModel(id, on: surface, in: settings)
+      return .written(forced: false)
     }
 
     /// An ordinary spoken-punctuation write: `enabled` is assigned directly; the override

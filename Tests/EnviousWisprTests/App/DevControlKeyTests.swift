@@ -44,7 +44,8 @@
         settings: settings,
         writeContext: DevControlSettings.WriteContext(
           modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-          connectedInputUIDs: { [] }, pillWordsCapability: { .available }),
+          loadCachedModelCatalog: { _, _ in },
+          connectedInputUIDs: { [] }, inputChannelCounts: { [:] }, pillWordsCapability: { .available }),
         status: status.sources,
         history: DevControlFixtures.history([]),
         models: DevControlFixtures.ModelFake().actions,

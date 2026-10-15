@@ -175,6 +175,19 @@ def build_server():
         return call("language", "set", "--", code, mutation=True)
 
     @server.tool()
+    def ew_channel_set(device_uid: str, channel: int) -> CallToolResult:
+        """Pick a connected multi-input microphone's input (0 is Input 1)."""
+        return call("channel", "set", "--", device_uid, str(int(channel)), mutation=True)
+
+    @server.tool()
+    def ew_shortcut_set(role: Literal["record", "cancel", "quickAdd", "pasteLast", "copyLast"],
+                        key_code: int, modifiers: int) -> CallToolResult:
+        """Save a Keybinds shortcut whole, checked as the screen checks it. `modifiers` is the
+        modifier-flags integer (0 for none); recording is stored as the toggle pair."""
+        return call("shortcut", "set", "--", role, str(int(key_code)), str(int(modifiers)),
+                    mutation=True)
+
+    @server.tool()
     def ew_keys_set(provider: Literal["openai", "gemini", "claude"],
                     secret_name: str) -> CallToolResult:
         """Save a provider's API key from a stored secret NAME (get-key), never a key value.

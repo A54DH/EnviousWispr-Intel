@@ -1,6 +1,7 @@
 #if DEBUG
   import AppKit
   import EnviousWisprCore
+  import EnviousWisprLLM
   import EnviousWisprServices
   import Foundation
   import SwiftParser
@@ -107,23 +108,20 @@
       #expect(kinds.keys.sorted() == ["direct", "extractedCheck", "staging", "viaOwner"])
     }
 
-    @Test("deferred routes and legacy fields are named as the plan places them")
-    func deferredAndLegacyPlacement() {
+    @Test("checked kinds and legacy fields are named as the plan places them")
+    func kindAndLegacyPlacement() {
       func entry(_ key: SettingsManager.SettingKey) -> DevControlSettings.Entry {
         DevControlSettings.entry(key)
       }
-      #expect(entry(.languageMode).deferredTo == nil)
-      #expect(entry(.englishSpelling).deferredTo == nil)
-      #expect(entry(.recordingPillDesignWithWords).deferredTo == nil)
-      #expect(entry(.recordingPillDesignWithoutWords).deferredTo == nil)
-      #expect(entry(.toggleKeyCode).deferredTo == "PR-C")
-      #expect(entry(.inputChannelByDeviceUID).deferredTo == "PR-C")
+      #expect(entry(.toggleKeyCode).kind == .extractedCheck)
+      #expect(entry(.copyLastModifiers).kind == .extractedCheck)
+      #expect(entry(.inputChannelByDeviceUID).kind == .extractedCheck)
       #expect(entry(.vadSilenceTimeout).kind == .extractedCheck)
       #expect(
         entry(.selectedInputDeviceUID)
           == DevControlSettings.Entry(
             key: .selectedInputDeviceUID, name: "selectedInputDeviceUID", kind: .viaOwner,
-            deferredTo: nil, legacy: false))
+            legacy: false))
       #expect(entry(.whisperKitLanguage).legacy == true)
       #expect(entry(.pushToTalkKeyCode).legacy == true)
       #expect(entry(.pushToTalkModifiers).legacy == true)
@@ -546,10 +544,13 @@
 
     private static func context(
       catalog: DevControlSettings.ModelCatalog = .init(provider: nil, models: []),
-      connected: [String] = [], pill: PillWordsCapability = .available
+      connected: [String] = [], pill: PillWordsCapability = .available,
+      channels: [String: Int] = [:]
     ) -> DevControlSettings.WriteContext {
       DevControlSettings.WriteContext(
-        modelCatalog: { catalog }, connectedInputUIDs: { connected },
+        modelCatalog: { catalog }, loadCachedModelCatalog: { _, _ in },
+        connectedInputUIDs: { connected },
+        inputChannelCounts: { channels },
         pillWordsCapability: { pill })
     }
 
@@ -749,61 +750,238 @@
       }
     }
 
+    // MARK: - Silence timeout (PR-C)
+
+    @Test("an ordinary silence-timeout write takes only the slider's quarter-second values")
+    func silenceTimeoutTakesSliderValues() throws {
+      let offered = ["0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0", "2.25", "2.5", "2.75", "3.0"]
+      for text in offered {
+        let (_, _, settings) = Self.fixture()
+        settings.vadSilenceTimeout = text == "0.5" ? 3.0 : 0.5
+        var fired: [(SettingsManager.SettingKey, Bool)] = []
+        settings.onChange = { fired.append(($0, settings.isDevControlWrite)) }
+        let outcome = DevControlSettings.write(
+          .vadSilenceTimeout, value: try Self.wire(text), force: false, context: Self.context(),
+          to: settings)
+        #expect(outcome == .written(forced: false), "\(text)")
+        #expect(settings.vadSilenceTimeout == Double(text), "\(text)")
+        #expect(fired.map(\.0) == [.vadSilenceTimeout] && fired.allSatisfy { $0.1 }, "\(text)")
+        #expect(settings.isDevControlWrite == false)
+      }
+    }
+
+    @Test("off-step or out-of-range values are checkFailed, wrong types badValue, nothing written")
+    func silenceTimeoutRefusals() throws {
+      for (text, code) in [
+        ("0.25", "checkFailed"), ("3.25", "checkFailed"), ("1.1", "checkFailed"),
+        ("0.6", "checkFailed"), ("120", "checkFailed"), ("1e30", "badValue"), ("true", "badValue"),
+        ("\"2\"", "badValue"), ("null", "badValue"),
+      ] {
+        let (suite, defaults, settings) = Self.fixture()
+        let before = settings.vadSilenceTimeout
+        let stored = defaults.persistentDomain(forName: suite) as NSDictionary?
+        var fired: [SettingsManager.SettingKey] = []
+        settings.onChange = { fired.append($0) }
+        let outcome = DevControlSettings.write(
+          .vadSilenceTimeout, value: try Self.wire(text), force: false, context: Self.context(),
+          to: settings)
+        #expect(outcome.code == code, "\(text)")
+        #expect(settings.vadSilenceTimeout == before, "\(text)")
+        #expect(fired.isEmpty, "\(text)")
+        #expect(stored == defaults.persistentDomain(forName: suite) as NSDictionary?, "\(text)")
+      }
+    }
+
     /// Written here by hand from plan §3.4, not derived from the table.
-    private static let deferredNames: Set<String> = [
-      "cancelKeyCode", "cancelModifiers", "quickAddKeyCode",
-      "quickAddModifiers", "pasteLastKeyCode", "pasteLastModifiers", "copyLastKeyCode",
-      "copyLastModifiers", "toggleKeyCode", "toggleModifiers", "fileImportLLMProvider",
-      "fileImportLLMModel", "fileImportOllamaModel", "ollamaModel", "vadSilenceTimeout",
-      "inputChannelByDeviceUID",
+    private static let shortcutNames: Set<String> = [
+      "cancelKeyCode", "cancelModifiers", "quickAddKeyCode", "quickAddModifiers",
+      "pasteLastKeyCode", "pasteLastModifiers", "copyLastKeyCode", "copyLastModifiers",
+      "toggleKeyCode", "toggleModifiers",
     ]
 
-    @Test("every key has exactly one ordinary route; 16 are not shared yet")
+    @Test("every key has exactly one ordinary route; the 10 shortcut fields are checked whole")
     func routeCounts() {
       var counts: [DevControlSettings.Route: Int] = [:]
-      var notYetShared: Set<String> = []
+      var shortcutFields: Set<String> = []
       for key in DevControlSettings.allKeys {
         let route = DevControlSettings.route(key)
         counts[route, default: 0] += 1
-        if route == .notYetShared { notYetShared.insert(DevControlSettings.name(key)) }
+        if route == .shortcutField { shortcutFields.insert(DevControlSettings.name(key)) }
       }
-      #expect(notYetShared == Self.deferredNames)
+      #expect(shortcutFields == Self.shortcutNames)
       #expect(counts[.typed] == 46)
       #expect(counts[.modelCatalog] == 1)
       #expect(counts[.inputDevice] == 2)
       #expect(counts[.spokenPunctuation] == 1)
       #expect(counts[.pillDesign] == 2)
       #expect(counts[.languageCommand] == 2)
-      #expect(counts[.notYetShared] == 16)
+      #expect(counts[.silenceTimeout] == 1)
+      #expect(counts[.importProvider] == 1)
+      #expect(counts[.importModel] == 1)
+      #expect(counts[.ollamaModel] == 2)
+      #expect(counts[.channelCommand] == 1)
+      #expect(counts[.shortcutField] == 10)
+      #expect(counts.values.reduce(0, +) == 70)
       #expect(DevControlSettings.route(.llmModel) == .modelCatalog)
       #expect(DevControlSettings.route(.hasCompletedOnboarding) == .typed)
     }
 
-    @Test("the 16 deferred keys refuse an ordinary write without any change, and force still writes them")
-    func deferredKeysRefuseOrdinaryWrites() throws {
-      var refused = 0
-      for row in Self.rows where Self.deferredNames.contains(row.name) {
-        let (suite, defaults, settings) = Self.fixture()
-        let key = try #require(DevControlSettings.key(named: row.name))
-        let text = row.wire(settings)
-        let before = DevControlSettings.read(key, from: settings)
-        let stored = defaults.persistentDomain(forName: suite) as NSDictionary?
-        var fired: [SettingsManager.SettingKey] = []
-        settings.onChange = { fired.append($0) }
-        let outcome = DevControlSettings.write(
-          key, value: try Self.wire(text), force: false, context: Self.context(), to: settings)
-        #expect(outcome == .refused(code: "checkNotYetShared", message: outcome.message), "\(row.name)")
-        #expect((before as AnyObject).isEqual(DevControlSettings.read(key, from: settings)), "\(row.name)")
-        #expect(fired.isEmpty, "\(row.name) fired \(fired)")
-        #expect(stored == defaults.persistentDomain(forName: suite) as NSDictionary?, "\(row.name)")
-        refused += 1
-
-        let forced = DevControlSettings.write(
-          key, value: try Self.wire(text), force: true, context: Self.context(), to: settings)
-        #expect(forced == .written(forced: true), "\(row.name)")
-        #expect(row.holds(settings), "\(row.name)")
+    @Test("a typed route is exactly a direct or staging row, or the onboarding alias")
+    func typedRouteMatchesKind() {
+      for key in DevControlSettings.allKeys where key != .llmModel {
+        let kind = DevControlSettings.entry(key).kind
+        let expected = kind == .direct || kind == .staging || key == .hasCompletedOnboarding
+        #expect(
+          (DevControlSettings.route(key) == .typed) == expected, "\(DevControlSettings.name(key))")
       }
-      #expect(refused == 16)
+    }
+
+    @Test("each shortcut field names its own row and half, matching the screen's fields")
+    func shortcutFieldsMatchTheScreen() throws {
+      let (_, _, settings) = Self.fixture()
+      var seen = 0
+      for key in DevControlSettings.allKeys {
+        guard let field = DevControlSettings.shortcutField(key) else {
+          #expect(!Self.shortcutNames.contains(DevControlSettings.name(key)))
+          continue
+        }
+        seen += 1
+        // Written through the screen's field path, read back through the door's table.
+        if field.isKeyCode {
+          settings[keyPath: ShortcutSettings.keyCodeField(for: field.role)] = 4000 + UInt16(seen)
+          #expect(DevControlSettings.read(key, from: settings) as? Int == 4000 + seen)
+        } else {
+          let flags = NSEvent.ModifierFlags(rawValue: UInt(1 << (16 + seen)))
+          settings[keyPath: ShortcutSettings.modifiersField(for: field.role)] = flags
+          #expect(DevControlSettings.read(key, from: settings) as? UInt == flags.rawValue)
+        }
+      }
+      #expect(seen == 10)
+    }
+
+    @Test("all five shortcuts go through the screen's check and save, with each role's own pair")
+    func setShortcutForEveryRole() {
+      let (_, _, settings) = Self.fixture()
+      let codes: [ShortcutRole: UInt16] = [
+        .record: 122, .cancel: 120, .quickAdd: 99, .pasteLast: 118, .copyLast: 96,
+      ]
+      for role in ShortcutRole.allCases {
+        var fired: [(SettingsManager.SettingKey, Bool)] = []
+        settings.onChange = { fired.append(($0, settings.isDevControlWrite)) }
+        let outcome = DevControlSettings.setShortcut(
+          role, keyCode: codes[role]!, modifiers: [.control, .option], to: settings)
+        #expect(outcome == .written(forced: false), "\(role)")
+        #expect(fired.count == 2 && fired.allSatisfy(\.1), "\(role): \(fired)")
+        #expect(settings.isDevControlWrite == false)
+      }
+      #expect(settings.toggleKeyCode == 122 && settings.toggleModifiers == [.control, .option])
+      #expect(settings.cancelKeyCode == 120)
+      #expect(settings.quickAddKeyCode == 99)
+      #expect(settings.pasteLastKeyCode == 118)
+      #expect(settings.copyLastKeyCode == 96 && settings.copyLastModifiers == [.control, .option])
+    }
+
+    @Test("a refused shortcut changes nothing and fires nothing")
+    func refusedShortcutsChangeNothing() {
+      for (role, keyCode, modifiers): (ShortcutRole, UInt16, NSEvent.ModifierFlags) in [
+        (.quickAdd, 8, [.command]),  // Command-C
+        (.quickAdd, 9, [.control, .command]),  // Paste Last's default
+        (.quickAdd, 40, [.option]),  // needs Option, which recording uses alone
+        (.record, 53, []),  // Cancel's Escape
+      ] {
+        let (suite, defaults, settings) = Self.fixture()
+        let before = settings.shortcutBindings
+        let stored = defaults.persistentDomain(forName: suite) as NSDictionary?
+        var fired = 0
+        settings.onChange = { _ in fired += 1 }
+        let outcome = DevControlSettings.setShortcut(
+          role, keyCode: keyCode, modifiers: modifiers, to: settings)
+        #expect(outcome.code == "checkFailed", "\(role) \(keyCode)")
+        #expect(settings.shortcutBindings == before)
+        #expect(fired == 0)
+        #expect(stored == defaults.persistentDomain(forName: suite) as NSDictionary?)
+      }
+    }
+
+    @Test("numbers are stored the way the screen stores the key")
+    func setShortcutNormalizes() {
+      let (_, _, settings) = Self.fixture()
+      // A lone Right Command with its own flag set stores no modifiers.
+      #expect(
+        DevControlSettings.setShortcut(
+          .record, keyCode: ModifierKeyCodes.rightCommand, modifiers: [.command], to: settings)
+          == .written(forced: false))
+      #expect(settings.toggleKeyCode == ModifierKeyCodes.rightCommand && settings.toggleModifiers == [])
+      // A chord keeps only Command, Option, Control and Shift.
+      #expect(
+        DevControlSettings.setShortcut(
+          .quickAdd, keyCode: 40, modifiers: [.control, .shift, .capsLock, .function],
+          to: settings) == .written(forced: false))
+      #expect(settings.quickAddKeyCode == 40 && settings.quickAddModifiers == [.control, .shift])
+    }
+
+    @Test("Globe saved from the door leaves the one-time Globe explanation for the screen")
+    func doorGlobeLeavesTheClaim() {
+      let (_, _, settings) = Self.fixture()
+      #expect(
+        DevControlSettings.setShortcut(
+          .record, keyCode: ModifierKeyCodes.globe, modifiers: [], to: settings)
+          == .written(forced: false))
+      #expect(settings.claimGlobeKeyGuidancePresentation(for: ModifierKeyCodes.globe))
+    }
+
+    @Test("one field on its own is checked whole with the other half as saved")
+    func singleFieldIsCheckedWhole() throws {
+      let (_, _, settings) = Self.fixture()
+      func write(_ key: SettingsManager.SettingKey, _ json: String) throws
+        -> DevControlSettings.SetOutcome
+      {
+        DevControlSettings.write(
+          key, value: try Self.wire(json), force: false, context: Self.context(), to: settings)
+      }
+      // Copy Last is Control-Command-C. Its key code alone to V makes Paste Last's shortcut.
+      #expect(try write(.copyLastKeyCode, "9").code == "checkFailed")
+      #expect(settings.copyLastKeyCode == 8)
+      // Its modifiers alone to Control-Shift make Control-Shift-C, which is free.
+      let controlShift = NSEvent.ModifierFlags([.control, .shift]).rawValue
+      #expect(try write(.copyLastModifiers, "\(controlShift)") == .written(forced: false))
+      #expect(settings.copyLastKeyCode == 8 && settings.copyLastModifiers == [.control, .shift])
+      // Then the key code to V is Control-Shift-V, also free.
+      #expect(try write(.copyLastKeyCode, "9") == .written(forced: false))
+      #expect(settings.copyLastKeyCode == 9)
+      #expect(try write(.toggleKeyCode, "1.5").code == "badValue")
+      #expect(try write(.toggleModifiers, "true").code == "badValue")
+    }
+
+    @Test("the whole shortcut can change where its first half alone would clash")
+    func compoundChangeSucceedsWhereAHalfWouldNot() throws {
+      let (_, _, settings) = Self.fixture()
+      // Control-Shift-V for Copy Last: the key code first would make Paste Last's shortcut.
+      #expect(
+        DevControlSettings.write(
+          .copyLastKeyCode, value: try Self.wire("9"), force: false, context: Self.context(),
+          to: settings).code == "checkFailed")
+      #expect(
+        DevControlSettings.setShortcut(
+          .copyLast, keyCode: 9, modifiers: [.control, .shift], to: settings)
+          == .written(forced: false))
+      #expect(settings.copyLastKeyCode == 9 && settings.copyLastModifiers == [.control, .shift])
+      #expect(settings.pasteLastKeyCode == 9 && settings.pasteLastModifiers == [.control, .command])
+    }
+
+    @Test("force still stages a clashing or unusual shortcut field as given")
+    func forceStagesShortcutFields() throws {
+      let (_, _, settings) = Self.fixture()
+      #expect(
+        DevControlSettings.write(
+          .toggleKeyCode, value: try Self.wire("53"), force: true, context: Self.context(),
+          to: settings) == .written(forced: true))
+      #expect(settings.toggleKeyCode == 53, "Cancel's key, staged")
+      #expect(
+        DevControlSettings.write(
+          .toggleModifiers, value: try Self.wire("\(NSEvent.ModifierFlags.capsLock.rawValue)"),
+          force: true, context: Self.context(), to: settings) == .written(forced: true))
+      #expect(settings.toggleModifiers == .capsLock, "not narrowed")
     }
 
     @Test("every typed-route key takes an ordinary write, reported not forced")
@@ -832,6 +1010,275 @@
       LLMModelInfo(id: id, displayName: id, provider: provider, isAvailable: available, isRemote: remote)
     }
 
+    @Test("the import provider: a pick seeds then overrides, null follows dictation, none is its own choice")
+    func importProviderRoute() throws {
+      let (_, _, settings) = Self.fixture()
+      settings.llmProvider = .openAI
+      settings.llmModel = "gpt-dictation"
+      settings.ollamaModel = "llama-dictation"
+      var fired: [(SettingsManager.SettingKey, Bool)] = []
+      settings.onChange = { fired.append(($0, settings.isDevControlWrite)) }
+      func write(_ text: String) throws -> DevControlSettings.SetOutcome {
+        DevControlSettings.write(
+          .fileImportLLMProvider, value: try Self.wire(text), force: false,
+          context: Self.context(), to: settings)
+      }
+      #expect(try write(#""gemini""#) == .written(forced: false))
+      #expect(settings.fileImportLLMProvider == .gemini)
+      #expect(settings.fileImportOllamaModel == "llama-dictation", "seeded before the override")
+      #expect(fired.allSatisfy { $0.1 } && settings.isDevControlWrite == false)
+      #expect(try write(#""none""#) == .written(forced: false))
+      #expect(settings.fileImportLLMProvider == LLMProvider.none)
+      #expect(try write("null") == .written(forced: false))
+      #expect(settings.fileImportLLMProvider == nil, "back to following dictation")
+      fired.removeAll()
+      for bad in [#""bogus""#, "3", "true"] {
+        #expect(try write(bad).code == "badValue", "\(bad)")
+      }
+      #expect(fired.isEmpty && settings.fileImportLLMProvider == nil)
+      #expect(settings.llmProvider == .openAI && settings.llmModel == "gpt-dictation")
+    }
+
+    @Test("the import model goes through the import provider's catalog and creates the override")
+    func importModelRoute() throws {
+      let (_, _, settings) = Self.fixture()
+      settings.llmProvider = .openAI
+      settings.llmModel = "gpt-dictation"
+      let catalog = DevControlSettings.ModelCatalog(
+        provider: .openAI, models: [Self.model("gpt-import", .openAI)])
+      func write(_ id: Any, _ catalog: DevControlSettings.ModelCatalog) -> DevControlSettings.SetOutcome {
+        DevControlSettings.write(
+          .fileImportLLMModel, value: id, force: false, context: Self.context(catalog: catalog),
+          to: settings)
+      }
+      #expect(write("gpt-missing", catalog).code == "badValue")
+      #expect(write("gpt-import", .init(provider: .gemini, models: catalog.models)).code == "catalogUnavailable")
+      #expect(write(5, catalog).code == "badValue")
+      #expect(settings.fileImportLLMProvider == nil, "a refusal never creates the override")
+      #expect(write("gpt-import", catalog) == .written(forced: false))
+      #expect(settings.fileImportLLMProvider == .openAI)
+      #expect(settings.fileImportLLMModel == "gpt-import")
+      #expect(settings.llmModel == "gpt-dictation")
+    }
+
+    @Test("an Ollama model write needs that surface's provider to be Ollama, then takes the menu's path")
+    func ollamaModelRoutes() throws {
+      let (_, _, settings) = Self.fixture()
+      settings.llmProvider = .openAI
+      let ollama = DevControlSettings.ModelCatalog(
+        provider: .ollama, models: [Self.model("local-dev:1b", .ollama)])
+      func write(_ key: SettingsManager.SettingKey, _ id: String) -> DevControlSettings.SetOutcome {
+        DevControlSettings.write(
+          key, value: id, force: false, context: Self.context(catalog: ollama), to: settings)
+      }
+      let before = (settings.ollamaModel, settings.llmModel, settings.fileImportOllamaModel)
+      #expect(write(.ollamaModel, "local-dev:1b").code == "checkFailed")
+      #expect(write(.fileImportOllamaModel, "local-dev:1b").code == "checkFailed")
+      #expect((settings.ollamaModel, settings.llmModel, settings.fileImportOllamaModel) == before)
+      #expect(settings.fileImportLLMProvider == nil)
+
+      settings.llmProvider = .ollama
+      #expect(write(.ollamaModel, "local-dev:1b") == .written(forced: false))
+      #expect(settings.llmModel == "local-dev:1b", "the menu's own write; sync mirrors it live")
+      #expect(write(.ollamaModel, "missing:1b").code == "badValue")
+
+      settings.llmProvider = .openAI
+      settings.fileImportLLMProvider = .ollama
+      #expect(write(.fileImportOllamaModel, "local-dev:1b") == .written(forced: false))
+      #expect(settings.fileImportLLMModel == "local-dev:1b")
+      #expect(settings.llmProvider == .openAI)
+    }
+
+    @Test("channel.set takes an input a connected multi-input device has, and only that device's")
+    func channelSet() {
+      let (_, _, settings) = Self.fixture()
+      settings.inputChannelByDeviceUID = ["mic-b": 2]
+      let context = Self.context(channels: ["mic-a": 4, "mic-b": 4, "mono": 1])
+      var fired: [(SettingsManager.SettingKey, Bool)] = []
+      settings.onChange = { fired.append(($0, settings.isDevControlWrite)) }
+      #expect(DevControlSettings.setChannel(3, for: "mic-a", context: context, to: settings)
+        == .written(forced: false))
+      #expect(DevControlSettings.setChannel(0, for: "mic-a", context: context, to: settings)
+        == .written(forced: false))
+      #expect(settings.inputChannelByDeviceUID == ["mic-a": 0, "mic-b": 2])
+      #expect(fired.map(\.0) == [.inputChannelByDeviceUID, .inputChannelByDeviceUID])
+      #expect(fired.allSatisfy { $0.1 } && settings.isDevControlWrite == false)
+      fired.removeAll()
+      for (channel, uid) in [(4, "mic-a"), (-1, "mic-a"), (0, "mono"), (1, "gone"), (0, "")] {
+        #expect(
+          DevControlSettings.setChannel(channel, for: uid, context: context, to: settings).code
+            == "checkFailed", "\(uid) \(channel)")
+      }
+      #expect(settings.inputChannelByDeviceUID == ["mic-a": 0, "mic-b": 2])
+      #expect(fired.isEmpty)
+    }
+
+    @Test("a whole-map channel write is refused toward channel.set; force stages an invalid index")
+    func channelMapWrites() throws {
+      let (_, _, settings) = Self.fixture()
+      let map = #"{"mic-a": 9}"#
+      let refused = DevControlSettings.write(
+        .inputChannelByDeviceUID, value: try Self.wire(map), force: false,
+        context: Self.context(channels: ["mic-a": 2]), to: settings)
+      #expect(refused.code == "checkFailed" && refused.message.contains("channel.set"))
+      #expect(settings.inputChannelByDeviceUID.isEmpty)
+      let forced = DevControlSettings.write(
+        .inputChannelByDeviceUID, value: try Self.wire(map), force: true,
+        context: Self.context(channels: ["mic-a": 2]), to: settings)
+      #expect(forced == .written(forced: true))
+      #expect(settings.inputChannelByDeviceUID == ["mic-a": 9])
+      #expect(
+        InputChannelSettings.selection(
+          for: "mic-a", inputChannelCount: 2, in: settings.inputChannelByDeviceUID) == 0,
+        "a saved input the device does not have shows as Input 1")
+    }
+
+    @Test("all four model keys load the saved catalog without mounting a screen")
+    func modelRoutesLoadCachedCatalogs() throws {
+      let routes: [(SettingsManager.SettingKey, LLMProvider, ProviderSetupSurface)] = [
+        (.llmModel, .openAI, .dictation),
+        (.fileImportLLMModel, .gemini, .fileImport),
+        (.ollamaModel, .ollama, .dictation),
+        (.fileImportOllamaModel, .ollama, .fileImport),
+      ]
+      for (key, provider, surface) in routes {
+        let (_, cache, settings) = Self.fixture()
+        let discovery = LLMModelDiscoveryCoordinator(
+          keychainManager: KeychainManager(), cacheDefaults: cache)
+        discovery.loadCachedModels(for: .claude, settings: settings, surface: .dictation)
+
+        let providerKey: SettingsManager.SettingKey =
+          surface == .dictation ? .llmProvider : .fileImportLLMProvider
+        #expect(
+          DevControlSettings.write(
+            providerKey, value: provider.rawValue, force: false, context: Self.context(),
+            to: settings) == .written(forced: false))
+        let dictationBefore = settings.llmModel
+        let id = provider == .ollama ? "local-dev:1b" : "cached-dev-model"
+        cache.set(
+          try JSONEncoder().encode([Self.model(id, provider)]),
+          forKey: "cachedModels_\(provider.rawValue)")
+
+        var loads = 0
+        var context = Self.context()
+        context.modelCatalog = {
+          .init(provider: discovery.stateProvider, models: discovery.discoveredModels)
+        }
+        context.loadCachedModelCatalog = { requestedProvider, requestedSurface in
+          loads += 1
+          #expect(requestedProvider == provider)
+          #expect(requestedSurface == surface)
+          #expect(settings.isDevControlWrite)
+          discovery.loadCachedModels(
+            for: requestedProvider, settings: settings, surface: requestedSurface)
+        }
+
+        #expect(
+          DevControlSettings.write(key, value: id, force: false, context: context, to: settings)
+            == .written(forced: false), "\(DevControlSettings.name(key))")
+        #expect(loads == 1)
+        #expect(discovery.stateProvider == provider)
+        // The menu's write is the cloud-model field; the running app mirrors it into the Ollama
+        // field (`PipelineSettingsSync`), which these tests do not run.
+        #expect(
+          PolishSettings.cloudModel(on: surface, in: settings) == id, "\(DevControlSettings.name(key))")
+        #expect(settings.isDevControlWrite == false)
+        if surface == .fileImport {
+          #expect(settings.llmModel == dictationBefore)
+        }
+
+        // A usable published list is not replaced by another cache load.
+        #expect(
+          DevControlSettings.write(key, value: id, force: false, context: context, to: settings)
+            == .written(forced: false))
+        #expect(loads == 1)
+      }
+    }
+
+    @Test("unusable catalogs get one load attempt; decoding, fixed providers and force skip it")
+    func modelCacheLoadBoundaries() {
+      let (_, _, settings) = Self.fixture()
+      settings.llmProvider = .openAI
+      let initial = settings.llmModel
+      let unusable: [DevControlSettings.ModelCatalog] = [
+        .init(provider: nil, models: []),
+        .init(provider: .gemini, models: [Self.model("gemini-dev", .gemini)]),
+        .init(provider: .openAI, models: []),
+      ]
+      for catalog in unusable {
+        var loads = 0
+        var context = Self.context(catalog: catalog)
+        context.loadCachedModelCatalog = { _, _ in loads += 1 }
+        let result = DevControlSettings.write(
+          .llmModel, value: "missing", force: false, context: context, to: settings)
+        #expect(result.code == "catalogUnavailable")
+        #expect(result.message.contains("cached model catalog"))
+        #expect(loads == 1)
+        #expect(settings.llmModel == initial)
+      }
+
+      var loads = 0
+      var context = Self.context()
+      context.loadCachedModelCatalog = { _, _ in loads += 1 }
+      #expect(
+        DevControlSettings.write(
+          .llmModel, value: 7, force: false, context: context, to: settings
+        ).code == "badValue")
+      for provider in [LLMProvider.appleIntelligence, .egOne, .s1Mini, .none] {
+        settings.llmProvider = provider
+        #expect(
+          DevControlSettings.write(
+            .llmModel, value: "arbitrary", force: false, context: context, to: settings
+          ).code == "badValue")
+      }
+      #expect(
+        DevControlSettings.write(
+          .llmModel, value: "staged", force: true, context: context, to: settings)
+          == .written(forced: true))
+      #expect(loads == 0)
+    }
+
+    @Test("cache repair stays on the requested surface and is attributed even on refusal")
+    func modelCacheRepairBeforeRefusal() throws {
+      for surface in [ProviderSetupSurface.dictation, .fileImport] {
+        let (_, cache, settings) = Self.fixture()
+        settings.llmProvider = .gemini
+        settings.llmModel = "gemini-3.5-transcribe"
+        settings.fileImportLLMProvider = .gemini
+        settings.fileImportLLMModel = "gemini-3.5-transcribe"
+        cache.set(
+          try JSONEncoder().encode([
+            Self.model("gemini-3.5-transcribe", .gemini),
+            Self.model("gemini-3.7-flash", .gemini),
+          ]),
+          forKey: "cachedModels_gemini")
+        let discovery = LLMModelDiscoveryCoordinator(
+          keychainManager: KeychainManager(), cacheDefaults: cache)
+        var context = Self.context()
+        context.modelCatalog = {
+          .init(provider: discovery.stateProvider, models: discovery.discoveredModels)
+        }
+        context.loadCachedModelCatalog = {
+          discovery.loadCachedModels(for: $0, settings: settings, surface: $1)
+        }
+        var fired: [(SettingsManager.SettingKey, Bool)] = []
+        settings.onChange = { fired.append(($0, settings.isDevControlWrite)) }
+        let key: SettingsManager.SettingKey =
+          surface == .dictation ? .llmModel : .fileImportLLMModel
+
+        #expect(
+          DevControlSettings.write(
+            key, value: "not-in-catalog", force: false, context: context, to: settings
+          ).code == "badValue")
+        #expect(PolishSettings.cloudModel(on: surface, in: settings) == "gemini-3.7-flash")
+        let other: ProviderSetupSurface = surface == .dictation ? .fileImport : .dictation
+        #expect(PolishSettings.cloudModel(on: other, in: settings) == "gemini-3.5-transcribe")
+        #expect(fired.isEmpty == false)
+        #expect(fired.allSatisfy { $0.1 })
+        #expect(settings.isDevControlWrite == false)
+        #expect(discovery.discoveredModels.map(\.id) == ["gemini-3.7-flash"])
+      }
+    }
     @Test("an ordinary llmModel write admits only an offered model from the current provider's catalog")
     func modelAdmission() throws {
       let (_, _, settings) = Self.fixture()
