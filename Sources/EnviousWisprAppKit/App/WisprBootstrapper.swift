@@ -2266,6 +2266,34 @@ package final class WisprBootstrapper {
             aiAvailability: aiAvailability, setup: setup, savedKeyPresence: savedKeyPresence)
         })
       // #3765: every closure reads the app's own owner at request time; none caches.
+      let driverFor: @MainActor (ASRBackendType) -> KernelDictationDriver = {
+        [kernelDriver, whisperKernelDriver] backend in
+        backend == .whisper ? whisperKernelDriver : kernelDriver
+      }
+      let devControlDictation = DevControlDictation(
+        launchID: UUID(),
+        control: DevControlDictation.Control(
+          activeBackend: { [engineCoordinator] in engineCoordinator.status.active },
+          driverState: { driverFor($0).state },
+          readiness: { driverFor($0).engineReadiness },
+          continuingTakeID: { driverFor($0).continuingSessionID },
+          lastTakeID: { driverFor($0).lastTakeID },
+          terminalFacts: { DevControlDictation.TerminalFacts.of(driverFor($0), takeID: $1) },
+          start: { [dictationRuntime] in await dictationRuntime.toggleRecording(source: .programmatic) },
+          stop: { [dictationRuntime] in await dictationRuntime.devControlUserStop() },
+          cancel: { [dictationRuntime] in
+            await dictationRuntime.cancelRecording(trigger: .cancelButton)
+          },
+          frontApp: .live))
+      // Before the door can admit a start, so no take's terminal is missed.
+      dictationLifecycleCoordinator.devControlSessionEndedWithoutSave = {
+        [weak devControlDictation] backend, ending in
+        devControlDictation?.sessionEndedWithoutSave(backend, ending)
+      }
+      dictationLifecycleCoordinator.devControlSessionTerminalAccepted = {
+        [weak devControlDictation] backend, takeID in
+        devControlDictation?.sessionTerminalAccepted(backend, takeID)
+      }
       self.devControlDoor = DevControlDoor(
         dispatcher: DevControlDispatcher(
           settings: settings,
@@ -2274,7 +2302,8 @@ package final class WisprBootstrapper {
               DevControlSettings.ModelCatalog(
                 provider: llmDiscovery.stateProvider, models: llmDiscovery.discoveredModels)
             },
-            connectedInputUIDs: { AudioDeviceEnumerator.allInputDevices().map(\.uid) }),
+            connectedInputUIDs: { AudioDeviceEnumerator.allInputDevices().map(\.uid) },
+            pillWordsCapability: { [pillAppearance] in pillAppearance.wordsCapability }),
           status: DevControlDispatcher.StatusSources(
             engineStatus: { [engineCoordinator] in engineCoordinator.status },
             isSwitching: { [engineCoordinator] in engineCoordinator.isSwitching },
@@ -2289,6 +2318,15 @@ package final class WisprBootstrapper {
             visibleTranscripts: { [transcriptCoordinator] in
               transcriptCoordinator.visibleTranscripts
             }),
+          models: DevControlDispatcher.ModelActions(
+            parakeetDownload: { [modelDelivery] in modelDelivery.resumeParakeetDownload() },
+            parakeetCancel: { [modelDelivery] in modelDelivery.cancelParakeetDownload() },
+            whisperDownload: { [setup] in setup.whisperSetup.downloadModel() },
+            whisperCancel: { [setup] in setup.whisperSetup.cancelDownload() }),
+          dictation: devControlDictation,
+          credentials: CredentialWriter(
+            keychainManager: keychainManager, presence: savedKeyPresence,
+            discovery: llmDiscovery),
           words: customWordsCoordinator))
     #endif
     self.transcriptCoordinator = transcriptCoordinator

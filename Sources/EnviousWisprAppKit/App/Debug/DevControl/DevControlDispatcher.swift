@@ -19,6 +19,9 @@
       case settingsList = "settings.list"
       case settingsGet = "settings.get"
       case settingsSet = "settings.set"
+      case languageSet = "language.set"
+      case keysSet = "keys.set"
+      case keysClear = "keys.clear"
       case status
       case historyList = "history.list"
       case historyGet = "history.get"
@@ -26,6 +29,14 @@
       case wordsAdd = "words.add"
       case wordsUpdate = "words.update"
       case wordsRemove = "words.remove"
+      case modelsParakeetDownload = "models.parakeet.download"
+      case modelsParakeetCancel = "models.parakeet.cancel"
+      case modelsWhisperDownload = "models.whisper.download"
+      case modelsWhisperCancel = "models.whisper.cancel"
+      case dictationStart = "dictation.start"
+      case dictationStop = "dictation.stop"
+      case dictationCancel = "dictation.cancel"
+      case dictationReceipt = "dictation.receipt"
     }
 
     enum ErrorCode: String, CaseIterable {
@@ -39,6 +50,24 @@
       case notFound
       /// The word owner refused the change; the reply carries its own message.
       case rejected
+      /// Another dictation command is running, or the engine is not at rest.
+      case busy
+      case doorClosed
+      case frontAppNotRunning
+      case frontAppAmbiguous
+      case frontAppNotFront
+      /// The front app changed after a take started; its cancellation was requested and
+      /// the reply carries the take's receipt.
+      case frontAppLost
+      /// The start path warmed or refused without minting a take.
+      case notStarted
+      case notRecording
+      case superseded
+      case wrongLaunch
+      case unknownReceipt
+      case receiptExpired
+      /// The key store refused the save or clear; what is stored is now unknown.
+      case storeFailed
     }
 
     enum Result {
@@ -46,6 +75,8 @@
       /// door puts it in the request's log line.
       case ok([String: Any], forced: Bool = false)
       case error(code: String, message: String)
+      /// A refusal that still names a take the caller must inspect (`frontAppLost`).
+      case errorWithReceipt(code: String, message: String, receipt: [String: Any])
 
       static func failure(_ code: ErrorCode, _ message: String) -> Result {
         .error(code: code.rawValue, message: message)
@@ -81,6 +112,20 @@
       let visibleTranscripts: @MainActor () -> [Transcript]
     }
 
+    /// The Settings rows' model buttons, one closure each: Parakeet's foreground Resume and
+    /// Cancel (`ModelDeliveryHome.resumeParakeetDownload()` / `cancelParakeetDownload()`;
+    /// the row's background-upgrade and retry routes are not offered here) and
+    /// Whisper's Download and Cancel (`WhisperSetupService.downloadModel()` /
+    /// `cancelDownload()`). Each owner keeps its own guards and schedules its own work, so
+    /// a call returning means the button was pressed, never that a download finished or a
+    /// cancel drained.
+    struct ModelActions {
+      let parakeetDownload: @MainActor () -> Void
+      let parakeetCancel: @MainActor () -> Void
+      let whisperDownload: @MainActor () -> Void
+      let whisperCancel: @MainActor () -> Void
+    }
+
     /// Rows `history.list` returns when the request names no limit.
     static let defaultHistoryLimit = 20
     /// The most rows one `history.list` may ask for.
@@ -90,17 +135,28 @@
     private let writeContext: DevControlSettings.WriteContext
     private let statusSources: StatusSources
     private let history: HistorySource
+    private let models: ModelActions
+    /// The writer the AI Polish screen's Save and Clear use; every key command goes through it.
+    private let credentials: CredentialWriter
+    /// Dictation commands and their receipts. Its launch id is the door's.
+    let dictation: DevControlDictation
+    var launchID: UUID { dictation.launchID }
     /// The same coordinator Your Words calls; every word command goes through it.
     private let words: CustomWordsCoordinator
 
     init(
       settings: SettingsManager, writeContext: DevControlSettings.WriteContext,
-      status: StatusSources, history: HistorySource, words: CustomWordsCoordinator
+      status: StatusSources, history: HistorySource, models: ModelActions,
+      dictation: DevControlDictation, credentials: CredentialWriter,
+      words: CustomWordsCoordinator
     ) {
+      self.dictation = dictation
+      self.credentials = credentials
       self.settings = settings
       self.writeContext = writeContext
       self.statusSources = status
       self.history = history
+      self.models = models
       self.words = words
     }
 
@@ -120,6 +176,12 @@
         }
       case .settingsSet:
         return set(args)
+      case .languageSet:
+        return setLanguage(args)
+      case .keysSet:
+        return setKey(args)
+      case .keysClear:
+        return clearKey(args)
       case .status:
         return .ok(status())
       case .historyList:
@@ -134,6 +196,22 @@
         return wordsUpdate(args)
       case .wordsRemove:
         return wordsRemove(args)
+      case .modelsParakeetDownload:
+        return model(.parakeet, "download", args, models.parakeetDownload)
+      case .modelsParakeetCancel:
+        return model(.parakeet, "cancel", args, models.parakeetCancel)
+      case .modelsWhisperDownload:
+        return model(.whisper, "download", args, models.whisperDownload)
+      case .modelsWhisperCancel:
+        return model(.whisper, "cancel", args, models.whisperCancel)
+      case .dictationStart:
+        return await dictation.start(args)
+      case .dictationStop:
+        return await dictation.stop(args)
+      case .dictationCancel:
+        return await dictation.cancel(args)
+      case .dictationReceipt:
+        return dictation.receipt(args)
       }
     }
 
@@ -196,6 +274,82 @@
       }
     }
 
+    /// `{code}`: a language picker row code (`de`, `en`, `en-gb`, ...) or `auto`. The reply
+    /// reads both fields back, so it reports what the picker's path actually set.
+    private func setLanguage(_ args: [String: Any]) -> Result {
+      guard Set(args.keys) == ["code"], let code = args["code"] as? String else {
+        return .failure(.badArgs, "language.set takes code only, a string")
+      }
+      switch DevControlSettings.setLanguage(code, to: settings) {
+      case .written:
+        return .ok([
+          "languageMode": DevControlSettings.read(.languageMode, from: settings),
+          "englishSpelling": DevControlSettings.read(.englishSpelling, from: settings),
+        ])
+      case .refused(let code, let message):
+        return .error(
+          code: ErrorCode(rawValue: code)?.rawValue ?? ErrorCode.badValue.rawValue, message: message
+        )
+      }
+    }
+
+    // MARK: - Keys
+
+    /// The provider argument: a cloud polish provider's `LLMProvider` raw value only.
+    private func credentialProvider(_ raw: Any?) -> CredentialProvider? {
+      (raw as? String).flatMap(LLMProvider.init(rawValue:)).flatMap(CredentialProvider.init)
+    }
+
+    /// `{provider, value}`. The value is used for the store and nothing else: no reply, log
+    /// line or error message carries it. Admission matches the screen's Save, which is
+    /// enabled for any non-empty field and stores it as typed.
+    private func setKey(_ args: [String: Any]) -> Result {
+      guard Set(args.keys) == ["provider", "value"] else {
+        return .failure(.badArgs, "keys.set takes provider and value only")
+      }
+      guard let provider = credentialProvider(args["provider"]) else {
+        return .failure(.badValue, "provider must be openAI, gemini or claude")
+      }
+      guard let value = args["value"] as? String, !value.isEmpty else {
+        return .failure(.badArgs, "value must be a non-empty string")
+      }
+      // The save itself changes no setting; the scope covers any synchronous consequence.
+      let outcome = DevControlSettings.attributed(settings) {
+        credentials.save(value, for: provider, settings: settings, surface: .dictation)
+      }
+      switch outcome {
+      case .failed:
+        return .failure(.storeFailed, "the key store refused the save; the key is now unknown")
+      case .stored:
+        // The key check runs on; this reply is the store's acceptance, never its verdict.
+        return .ok(keyReply(provider, extra: ["stored": true, "validation": "started"]))
+      }
+    }
+
+    /// `{provider}`.
+    private func clearKey(_ args: [String: Any]) -> Result {
+      guard Set(args.keys) == ["provider"] else {
+        return .failure(.badArgs, "keys.clear takes provider only")
+      }
+      guard let provider = credentialProvider(args["provider"]) else {
+        return .failure(.badValue, "provider must be openAI, gemini or claude")
+      }
+      let outcome = DevControlSettings.attributed(settings) { credentials.clear(provider) }
+      switch outcome {
+      case .failed:
+        return .failure(.storeFailed, "the key store refused the clear; the key is now unknown")
+      case .cleared:
+        return .ok(keyReply(provider, extra: ["cleared": true]))
+      }
+    }
+
+    private func keyReply(_ provider: CredentialProvider, extra: [String: Any]) -> [String: Any] {
+      var reply = extra
+      reply["provider"] = provider.llmProvider.rawValue
+      reply["presence"] = Self.project(statusSources.savedKeyState(provider.llmProvider))
+      return reply
+    }
+
     // MARK: - Status
 
     /// One point-in-time reading. A download or a switch can move on the next instant, so
@@ -252,7 +406,7 @@
       ]
     }
 
-    private static func project(_ readiness: ASREngineReadiness) -> String {
+    static func project(_ readiness: ASREngineReadiness) -> String {
       switch readiness {
       case .notReady: return "notReady"
       case .warming: return "warming"
@@ -262,7 +416,7 @@
 
     /// `PipelineState.telemetryLabel` folds advisory into "error" on purpose for its
     /// series; a UAT script needs the two apart, so this mapping is its own.
-    private static func project(_ state: PipelineState) -> (state: String, reason: String?) {
+    static func project(_ state: PipelineState) -> (state: String, reason: String?) {
       switch state {
       case .idle: return ("idle", nil)
       case .loadingModel: return ("loadingModel", nil)
@@ -329,6 +483,28 @@
     /// whole reply unencodable.
     private static func finite(_ value: Double) -> Any {
       value.isFinite ? value : NSNull()
+    }
+
+    // MARK: - Models
+
+    /// `{}`: press one model button, then read that engine's state. The state is the
+    /// instant after the press: an owner that refused or had nothing to do leaves it as it
+    /// was, and one that scheduled work may not have moved it yet. Poll `status` for
+    /// progress; this reply is never a completion receipt.
+    private func model(
+      _ backend: ASRBackendType, _ action: String, _ args: [String: Any],
+      _ press: @MainActor () -> Void
+    ) -> Result {
+      guard !unexpectedKeys(args, allowed: []) else {
+        return .failure(.badArgs, "model commands take no arguments")
+      }
+      press()
+      let state: [String: Any]
+      switch backend {
+      case .parakeet: state = Self.project(statusSources.parakeetDelivery())
+      case .whisper: state = Self.project(statusSources.whisperSetup())
+      }
+      return .ok(["backend": backend.rawValue, "action": action, "state": state])
     }
 
     // MARK: - History

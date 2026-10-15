@@ -63,16 +63,22 @@
     private static func dispatcher(
       status: DevControlFixtures.StatusFake = DevControlFixtures.StatusFake(),
       rows: [Transcript] = [],
-      words: CustomWordsCoordinator = DevControlFixtures.unwrittenWords()
+      words: CustomWordsCoordinator = DevControlFixtures.unwrittenWords(),
+      models: DevControlFixtures.ModelFake = DevControlFixtures.ModelFake(),
+      dictation: DevControlDictation = DevControlFixtures.inertDictation(),
+      credentials: CredentialWriter = DevControlFixtures.isolatedCredentials()
     ) -> DevControlDispatcher {
       let defaults = TestDefaults.suite("ew.tests.3765.framing.\(UUID().uuidString)")!
       return DevControlDispatcher(
         settings: SettingsManager(defaults: defaults),
         writeContext: DevControlSettings.WriteContext(
           modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-          connectedInputUIDs: { [] }),
+          connectedInputUIDs: { [] }, pillWordsCapability: { .available }),
         status: status.sources,
         history: DevControlFixtures.history(rows),
+        models: models.actions,
+        dictation: dictation,
+        credentials: credentials,
         words: words)
     }
 
@@ -478,6 +484,112 @@
       try await stop(door)
     }
 
+    @Test("keys.set and keys.clear cross the socket to the writer; no reply or log line holds the key")
+    func keysOverTheSocket() async throws {
+      let presence = SavedKeyPresence()
+      let status = DevControlFixtures.StatusFake()
+      status.keyState = { presence.state(for: $0) }
+      let door = DevControlDoor(
+        dispatcher: Self.dispatcher(
+          status: status, credentials: DevControlFixtures.isolatedCredentials(presence: presence)))
+      var outcomes: [String] = []
+      door.onOutcomeLogged = { outcomes.append($0) }
+      defer { door.uninstall() }
+      try #require(await door.install() == .ready)
+
+      let secret = "sk-synthetic-\(UUID().uuidString)"
+      let reply = try await runClient(
+        #"""
+        c = dev_control.Connection(\#(door.pid))
+        saved = c.request("keys.set", {"provider": "claude", "value": "\#(secret)"})
+        cleared = c.request("keys.clear", {"provider": "claude"})
+        bad = c.request("keys.set", {"provider": "ollama", "value": "\#(secret)"})
+        print(json.dumps({"saved": saved, "cleared": cleared, "bad": bad}))
+        """#)
+      let saved = try #require((reply["saved"] as? [String: Any])?["result"] as? [String: Any])
+      #expect(saved["stored"] as? Bool == true)
+      #expect(saved["presence"] as? String == "present")
+      #expect(saved["validation"] as? String == "started")
+      let cleared = try #require((reply["cleared"] as? [String: Any])?["result"] as? [String: Any])
+      #expect(cleared["presence"] as? String == "absent")
+      #expect(((reply["bad"] as? [String: Any])?["error"] as? [String: Any])?["code"] as? String
+        == "badValue")
+      let encoded = String(decoding: try JSONSerialization.data(withJSONObject: reply), as: UTF8.self)
+      #expect(encoded.contains(secret) == false)
+      try #require(outcomes.count == 3, "outcomes: \(outcomes)")
+      #expect(outcomes[0].contains("cmd=keys.set ok=true forced=false code=none"))
+      #expect(outcomes.allSatisfy { !$0.contains(secret) && !$0.contains("claude") })
+      #expect(presence.state(for: .claude) == .absent)
+      try await stop(door)
+    }
+
+    @Test("a pill design write crosses the socket through the picker's route")
+    func pillDesignOverTheSocket() async throws {
+      let door = DevControlDoor(dispatcher: Self.dispatcher())
+      var outcomes: [String] = []
+      door.onOutcomeLogged = { outcomes.append($0) }
+      defer { door.uninstall() }
+      try #require(await door.install() == .ready)
+
+      let reply = try await runClient(
+        #"""
+        c = dev_control.Connection(\#(door.pid))
+        ok = c.request("settings.set", {"key": "recordingPillDesignWithWords", "value": "readingWell"})
+        wrong = c.request("settings.set", {"key": "recordingPillDesignWithWords", "value": "classic"})
+        preview = c.request("settings.get", {"key": "livePreviewEnabled"})
+        print(json.dumps({"ok": ok, "wrong": wrong, "preview": preview}))
+        """#)
+      let ok = try #require((reply["ok"] as? [String: Any])?["result"] as? [String: Any])
+      #expect(ok["value"] as? String == "readingWell")
+      #expect(ok["forced"] as? Bool == false)
+      #expect(ok["kind"] as? String == "viaOwner")
+      #expect(ok["deferredTo"] is NSNull)
+      let wrong = try #require(reply["wrong"] as? [String: Any])
+      #expect((wrong["error"] as? [String: Any])?["code"] as? String == "checkFailed")
+      let preview = try #require((reply["preview"] as? [String: Any])?["result"] as? [String: Any])
+      #expect(preview["value"] as? Bool == true, "the coupled pick turned Live Preview on")
+      try #require(outcomes.count == 3, "outcomes: \(outcomes)")
+      #expect(outcomes[0].contains("cmd=settings.set ok=true forced=false code=none"))
+      #expect(outcomes[1].contains("cmd=settings.set ok=false forced=false code=checkFailed"))
+      try await stop(door)
+    }
+
+    @Test("language.set crosses the socket and reports what the picker's path set")
+    func languageOverTheSocket() async throws {
+      let door = DevControlDoor(dispatcher: Self.dispatcher())
+      var outcomes: [String] = []
+      door.onOutcomeLogged = { outcomes.append($0) }
+      defer { door.uninstall() }
+      try #require(await door.install() == .ready)
+
+      let reply = try await runClient(
+        #"""
+        c = dev_control.Connection(\#(door.pid))
+        uk = c.request("language.set", {"code": "en-gb"})
+        auto = c.request("language.set", {"code": "auto"})
+        bad = c.request("language.set", {"code": "zz"})
+        extra = c.request("language.set", {"code": "de", "spelling": "british"})
+        single = c.request("settings.set", {"key": "englishSpelling", "value": "american"})
+        print(json.dumps({"uk": uk, "auto": auto, "bad": bad, "extra": extra, "single": single}))
+        """#)
+      let uk = try #require((reply["uk"] as? [String: Any])?["result"] as? [String: Any])
+      #expect(uk["languageMode"] as? [String: String] == ["mode": "locked", "code": "en"])
+      #expect(uk["englishSpelling"] as? String == "british")
+      let auto = try #require((reply["auto"] as? [String: Any])?["result"] as? [String: Any])
+      #expect(auto["languageMode"] as? [String: String] == ["mode": "auto"])
+      #expect(auto["englishSpelling"] as? String == "british")
+      func code(_ name: String) -> String? {
+        ((reply[name] as? [String: Any])?["error"] as? [String: Any])?["code"] as? String
+      }
+      #expect(code("bad") == "badValue")
+      #expect(code("extra") == "badArgs")
+      #expect(code("single") == "checkFailed")
+      try #require(outcomes.count == 5, "outcomes: \(outcomes)")
+      #expect(outcomes[0].contains("cmd=language.set ok=true forced=false code=none"))
+      #expect(outcomes.allSatisfy { !$0.contains("en-gb") && !$0.contains("british") })
+      try await stop(door)
+    }
+
     @Test("status and History over the socket; a History row too large to send is refused whole")
     func statusAndHistoryOverTheSocket() async throws {
       let small = Transcript(text: "small row", polishedText: "Small row.")
@@ -533,6 +645,101 @@
         #expect(line.contains("small row") == false)
       }
       try await stop(door)
+    }
+
+    @Test("each model command over the socket presses only its own button and reads that engine after")
+    func modelCommandsOverTheSocket() async throws {
+      let status = DevControlFixtures.StatusFake()
+      let models = DevControlFixtures.ModelFake()
+      models.onPress = { action in
+        switch action {
+        case "parakeetDownload":
+          status.parakeet = .downloading(fractionCompleted: 0, bytesWritten: 0, totalBytes: 10)
+        case "whisperDownload":
+          status.whisper = .downloading(progress: 0, status: "Starting download...")
+        default: break
+        }
+      }
+      let door = DevControlDoor(dispatcher: Self.dispatcher(status: status, models: models))
+      var outcomes: [String] = []
+      door.onOutcomeLogged = { outcomes.append($0) }
+      defer { door.uninstall() }
+      try #require(await door.install() == .ready)
+
+      let reply = try await runClient(
+        #"""
+        c = dev_control.Connection(\#(door.pid))
+        out = {}
+        for cmd in ["models.parakeet.download", "models.parakeet.cancel",
+                    "models.whisper.download", "models.whisper.cancel"]:
+            out[cmd] = c.request(cmd)
+        out["extra"] = c.request("models.parakeet.download", {"model": "x"})
+        print(json.dumps(out))
+        """#)
+      #expect(models.pressed == [
+        "parakeetDownload", "parakeetCancel", "whisperDownload", "whisperCancel",
+      ])
+      func result(_ cmd: String) throws -> [String: Any] {
+        try #require((reply[cmd] as? [String: Any])?["result"] as? [String: Any])
+      }
+      let parakeet = try result("models.parakeet.download")
+      #expect(parakeet["backend"] as? String == "parakeet")
+      #expect(parakeet["action"] as? String == "download")
+      #expect((parakeet["state"] as? [String: Any])?["state"] as? String == "downloading")
+      let whisper = try result("models.whisper.cancel")
+      #expect(whisper["backend"] as? String == "whisper")
+      #expect(whisper["action"] as? String == "cancel")
+      #expect((whisper["state"] as? [String: Any])?["state"] as? String == "downloading")
+      let extra = try #require(reply["extra"] as? [String: Any])
+      #expect((extra["error"] as? [String: Any])?["code"] as? String == "badArgs")
+
+      try #require(outcomes.count == 5, "outcomes: \(outcomes)")
+      #expect(outcomes[0].contains("cmd=models.parakeet.download ok=true"))
+      #expect(outcomes[3].contains("cmd=models.whisper.cancel ok=true"))
+      #expect(outcomes[4].contains("cmd=models.parakeet.download ok=false forced=false code=badArgs"))
+      try await stop(door)
+    }
+
+    @Test("frontAppLost crosses the socket with its receipt, whose launch is the door's own")
+    func frontAppLostReceiptOverTheSocket() async throws {
+      let runtime = DevControlDictationTests.FakeRuntime()
+      runtime.processes = ["com.apple.Notes": [42]]
+      runtime.onStart = { runtime in
+        runtime.mint()
+        runtime.front = 7
+      }
+      let dispatcher = Self.dispatcher(
+        dictation: DevControlDictation(launchID: UUID(), control: runtime.control))
+      let door = DevControlDoor(dispatcher: dispatcher)
+      #expect(door.launchID == dispatcher.launchID)
+      var outcomes: [String] = []
+      door.onOutcomeLogged = { outcomes.append($0) }
+      defer { door.uninstall() }
+      try #require(await door.install() == .ready)
+
+      let reply = try await runClient(
+        #"""
+        c = dev_control.Connection(\#(door.pid))
+        lost = c.request("dictation.start", {"frontApp": "com.apple.Notes"})
+        held = c.request("dictation.receipt", {"receipt": lost["error"]["receipt"]})
+        print(json.dumps({"lost": lost, "held": held}))
+        """#)
+      let lost = try #require(reply["lost"] as? [String: Any])
+      #expect(lost["ok"] as? Bool == false)
+      let error = try #require(lost["error"] as? [String: Any])
+      #expect(error["code"] as? String == "frontAppLost")
+      let receipt = try #require(error["receipt"] as? [String: String])
+      #expect(receipt["launch"] == door.launchID.uuidString)
+      #expect(receipt["launch"] == lost["launch"] as? String)
+      #expect(receipt["take"] == runtime.nextTake)
+      #expect(runtime.cancels == 1)
+      let held = try #require((reply["held"] as? [String: Any])?["result"] as? [String: Any])
+      #expect(held["status"] as? String == "pending")
+      try #require(outcomes.count == 2, "outcomes: \(outcomes)")
+      #expect(outcomes[0].contains("cmd=dictation.start ok=false forced=false code=frontAppLost"))
+      #expect(outcomes.allSatisfy { !$0.contains(runtime.nextTake) && !$0.contains("Notes") })
+      try await stop(door)
+      #expect(dispatcher.dictation.isClosed, "uninstall closes the receipt registry")
     }
 
     @Test("words CRUD over the socket logs no word content; a list too large to send is refused whole")

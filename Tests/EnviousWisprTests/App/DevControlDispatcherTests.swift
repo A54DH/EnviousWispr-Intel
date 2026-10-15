@@ -8,6 +8,7 @@
   import Testing
 
   @testable import EnviousWisprAppKit
+  @testable import EnviousWisprLLM
   @testable import EnviousWisprPostProcessing
   @testable import EnviousWisprStorage
 
@@ -26,9 +27,12 @@
         settings: settings,
         writeContext: DevControlSettings.WriteContext(
           modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-          connectedInputUIDs: { ["mic-a"] }),
+          connectedInputUIDs: { ["mic-a"] }, pillWordsCapability: { .available }),
         status: DevControlFixtures.StatusFake().sources,
         history: DevControlFixtures.history([]),
+        models: DevControlFixtures.ModelFake().actions,
+        dictation: DevControlFixtures.inertDictation(),
+        credentials: DevControlFixtures.isolatedCredentials(),
         words: DevControlFixtures.unwrittenWords())
       return (settings, dispatcher)
     }
@@ -61,6 +65,16 @@
       #expect(got["key"] as? String == "fillerRemovalEnabled")
       #expect(got["value"] as? Bool == false)
       #expect(got["kind"] as? String == "direct")
+
+      // A list row and a get reply describe one setting with the same field names, so a
+      // script can feed either one's `key` back into `settings get`.
+      for row in rows {
+        let name = try #require(row["key"] as? String, "list row without key: \(row)")
+        let single = try #require(
+          payload(await dispatcher.handle(.settingsGet, args: ["key": name])))
+        #expect(Set(row.keys) == Set(single.keys), "\(name)")
+        #expect(single["key"] as? String == name)
+      }
 
       #expect(code(await dispatcher.handle(.settingsGet, args: ["key": "nope"])) == "unknownKey")
       #expect(code(await dispatcher.handle(.settingsGet, args: ["key": 5])) == "badArgs")
@@ -147,10 +161,70 @@
       }
     }
 
+    // MARK: - Models
+
+    @Test(
+      "each model command presses exactly its own button once, then reads that engine's state",
+      arguments: [
+        (DevControlDispatcher.Command.modelsParakeetDownload, "parakeetDownload", "parakeet", "download"),
+        (.modelsParakeetCancel, "parakeetCancel", "parakeet", "cancel"),
+        (.modelsWhisperDownload, "whisperDownload", "whisper", "download"),
+        (.modelsWhisperCancel, "whisperCancel", "whisper", "cancel"),
+      ])
+    func modelCommandPressesOneButton(
+      command: DevControlDispatcher.Command, action: String, backend: String, verb: String
+    ) async throws {
+      let status = DevControlFixtures.StatusFake()
+      status.parakeet = .notReady
+      status.whisper = .notDownloaded
+      let models = DevControlFixtures.ModelFake()
+      // The owner moves its state when pressed; the reply must show the state AFTER.
+      models.onPress = { _ in
+        status.parakeet = .verifying
+        status.whisper = .paused
+      }
+      let (_, dispatcher) = Self.make(status: status, models: models)
+      let reply = try #require(payload(await dispatcher.handle(command, args: [:])))
+      #expect(models.pressed == [action])
+      #expect(reply["backend"] as? String == backend)
+      #expect(reply["action"] as? String == verb)
+      let state = try #require(reply["state"] as? [String: Any])
+      #expect(state["state"] as? String == (backend == "parakeet" ? "verifying" : "paused"))
+      #expect(JSONSerialization.isValidJSONObject(reply))
+    }
+
+    @Test("a model command whose owner does nothing reports the unchanged state")
+    func modelCommandWithIdleOwnerReportsUnchangedState() async throws {
+      let status = DevControlFixtures.StatusFake()
+      status.parakeet = .cancelled(resumable: true)
+      status.whisper = .ready
+      let models = DevControlFixtures.ModelFake()
+      let (_, dispatcher) = Self.make(status: status, models: models)
+      let parakeet = try #require(payload(await dispatcher.handle(.modelsParakeetCancel, args: [:])))
+      #expect(parakeet["state"] as? [String: AnyHashable] == ["state": "cancelled", "resumable": true])
+      let whisper = try #require(payload(await dispatcher.handle(.modelsWhisperDownload, args: [:])))
+      #expect(whisper["state"] as? [String: AnyHashable] == ["state": "ready"])
+      #expect(models.pressed == ["parakeetCancel", "whisperDownload"])
+    }
+
+    @Test("a model command with any argument is refused before any button is pressed")
+    func modelCommandRefusesArguments() async throws {
+      let models = DevControlFixtures.ModelFake()
+      let (_, dispatcher) = Self.make(status: DevControlFixtures.StatusFake(), models: models)
+      for command in [
+        DevControlDispatcher.Command.modelsParakeetDownload, .modelsParakeetCancel,
+        .modelsWhisperDownload, .modelsWhisperCancel,
+      ] {
+        #expect(code(await dispatcher.handle(command, args: ["backend": "parakeet"])) == "badArgs")
+      }
+      #expect(models.pressed.isEmpty)
+    }
+
     // MARK: - Status
 
     private static func make(
-      status: DevControlFixtures.StatusFake, rows: @escaping @MainActor () -> [Transcript] = { [] }
+      status: DevControlFixtures.StatusFake, rows: @escaping @MainActor () -> [Transcript] = { [] },
+      models: DevControlFixtures.ModelFake = DevControlFixtures.ModelFake()
     ) -> (SettingsManager, DevControlDispatcher) {
       let defaults = TestDefaults.suite("ew.tests.3765.dispatch.\(UUID().uuidString)")!
       let settings = SettingsManager(defaults: defaults)
@@ -158,9 +232,12 @@
         settings: settings,
         writeContext: DevControlSettings.WriteContext(
           modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-          connectedInputUIDs: { [] }),
+          connectedInputUIDs: { [] }, pillWordsCapability: { .available }),
         status: status.sources,
         history: DevControlDispatcher.HistorySource(visibleTranscripts: rows),
+        models: models.actions,
+        dictation: DevControlFixtures.inertDictation(),
+        credentials: DevControlFixtures.isolatedCredentials(),
         words: DevControlFixtures.unwrittenWords())
       return (settings, dispatcher)
     }
@@ -494,9 +571,12 @@ private static func make(words: CustomWordsCoordinator) -> (SettingsManager, Dev
     settings: settings,
     writeContext: DevControlSettings.WriteContext(
       modelCatalog: { DevControlSettings.ModelCatalog(provider: nil, models: []) },
-      connectedInputUIDs: { [] }),
+      connectedInputUIDs: { [] }, pillWordsCapability: { .available }),
     status: DevControlFixtures.StatusFake().sources,
     history: DevControlFixtures.history([]),
+    models: DevControlFixtures.ModelFake().actions,
+    dictation: DevControlFixtures.inertDictation(),
+    credentials: DevControlFixtures.isolatedCredentials(),
     words: words)
   return (settings, dispatcher)
 }
@@ -783,6 +863,62 @@ func wordCommandsLeaveSettingsAlone() async throws {
 
     static func history(_ rows: [Transcript]) -> DevControlDispatcher.HistorySource {
       DevControlDispatcher.HistorySource(visibleTranscripts: { rows })
+    }
+
+    /// The screen's credential writer over a fresh temporary key folder, a fresh presence and
+    /// a discovery that answers with no models: never the real key files or Keychain.
+    static func isolatedCredentials(
+      presence: SavedKeyPresence = SavedKeyPresence(),
+      storage: (any LegacyKeyFileStorage)? = nil,
+      emit: @escaping CredentialWriter.Emit = { _, _, _ in }
+    ) -> CredentialWriter {
+      let folder = FileManager.default.temporaryDirectory
+        .appending(path: "ew-tests-3765-keys-\(UUID().uuidString)")
+      let keychain = KeychainManager(
+        backend: .legacyFiles, legacyStore: storage ?? FileLegacyKeyStore(storageDirectory: folder))
+      let discovery = LLMModelDiscoveryCoordinator(
+        keychainManager: keychain,
+        cacheDefaults: TestDefaults.suite("ew.tests.3765.keys.cache.\(UUID().uuidString)")!,
+        savedKeyPresence: presence, discoverModels: { _, _ in [] })
+      var writer = CredentialWriter(keychainManager: keychain, presence: presence, discovery: discovery)
+      writer.emit = emit
+      return writer
+    }
+
+    /// A dictation owner whose runtime is at rest and never mints a take: for suites that
+    /// do not exercise dictation commands.
+    static func inertDictation() -> DevControlDictation {
+      DevControlDictation(
+        launchID: UUID(),
+        control: DevControlDictation.Control(
+          activeBackend: { .parakeet }, driverState: { _ in .idle }, readiness: { _ in .ready },
+          continuingTakeID: { _ in nil }, lastTakeID: { _ in nil },
+          terminalFacts: { _, _ in .init(savedRowID: nil, historySaved: true) },
+          start: {}, stop: {}, cancel: {},
+          frontApp: .init(
+            processes: { _ in [] }, activate: { _ in }, frontmost: { nil },
+            waitUntilFrontmost: { _ in false })))
+    }
+
+    /// Records which model button a command pressed, in order. `onPress` lets a test move
+    /// the matching status fact as a real owner would when it schedules work.
+    @MainActor
+    final class ModelFake {
+      private(set) var pressed: [String] = []
+      var onPress: (@MainActor (String) -> Void)?
+
+      var actions: DevControlDispatcher.ModelActions {
+        DevControlDispatcher.ModelActions(
+          parakeetDownload: { [self] in press("parakeetDownload") },
+          parakeetCancel: { [self] in press("parakeetCancel") },
+          whisperDownload: { [self] in press("whisperDownload") },
+          whisperCancel: { [self] in press("whisperCancel") })
+      }
+
+      private func press(_ action: String) {
+        pressed.append(action)
+        onPress?(action)
+      }
     }
 
     /// Mutable owner facts; `sources` reads them at call time, so a test can change one
