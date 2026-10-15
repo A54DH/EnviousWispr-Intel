@@ -201,7 +201,7 @@ struct TelemetryEmitterRegistryTests {
   /// #3735: `settingsChangeBlocked`'s `whisperKitState:` parameter is `whisperState:` (the
   /// property is `whisper_state`). Same event, site count, cadence and meaning.
   static let sitesFingerprint =
-    "1f8aaf63facab70616f2f399073e2e69a514738a20ad4fa08d0e733e3cffe92c"
+    "63cf42bfdd3fe3144c01d5a86522585cfe4ceb5d3c08d59c128ad7b935aa198c"
   static let ungradedFingerprint =
     "8c5e46c2f2f7fb59004bb2eb5ea1ac210ef32dbb79fdcb68b3eff70a28cc133f"
 

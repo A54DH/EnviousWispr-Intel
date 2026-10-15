@@ -43,10 +43,12 @@ struct SentryScopeWriterFreezeTests {
   /// model tags from our own manifests (model name, 8-character revision, variant) and a closed
   /// load phase, every value through `SentryEventSanitizer.redactString`, absent values removed.
   /// Written only by `ASRModelScopeOwner` through `updateASRModelScope`.
-  /// #3735: no new site. The adapter's `finalize` breadcrumb moved with its file rename to
-  /// the renamed `WhisperEngineAdapter.swift`; its data is unchanged metadata.
+  /// #3685: publishPolishScope configures the scope; writePolishScope redacts the complete
+  /// polish context at write time. writeStableTags adds four fixed/UUID process identity tags.
+  /// captureChildProcessFailure adds a metadata-only breadcrumb from the typed child facts.
+  /// #3735: the adapter's unchanged finalize breadcrumb moved to WhisperEngineAdapter.swift.
   static let inventoryFingerprint =
-    "44aae975f0aae33f4151e120c5ace8f20156a8fb553da1e404ef895a7085eb1e"
+    "29e4e0944304463156ece55a94d5a0d7c528556e71deb87860bf0dec811651a3"
 
   struct Site: Hashable, Comparable {
     let file: String
