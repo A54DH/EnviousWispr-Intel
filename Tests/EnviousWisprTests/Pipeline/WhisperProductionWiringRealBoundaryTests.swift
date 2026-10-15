@@ -239,8 +239,8 @@ struct WhisperProductionWiringRealBoundaryTests {
     adapter.acceptAudio(
       AudioBufferHandoff(
         buffer: buffer, frameCount: samples.count, sequence: 1, sessionID: session))
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: samples.count)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: samples.count)], captureSamples: samples)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected a transcript, got \(outcome)")
       return ""

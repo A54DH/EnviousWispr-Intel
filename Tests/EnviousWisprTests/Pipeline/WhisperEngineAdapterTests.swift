@@ -305,7 +305,7 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: [0.1, 0.2], session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 1600)])
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 1600)], captureSamples: [0.1, 0.2])
     // Begin a fresh session — must clear everything.
     try await adapter.beginSession(SessionID(), options: .default, streaming: false)
     #expect(adapter.lastResult == nil)
@@ -319,17 +319,21 @@ import Testing
   @Test("acceptAudio after a terminal session is a no-op")
   func acceptAudioAfterTerminalIsNoOp() async throws {
     let backend = StubWhisperBackend()
-    await backend.setObserveLIDResult(.unavailable)
+    await backend.setStreamingSessionFactory({ StubIncrementalSession(result: .accepted(text: "ok")) })
     let adapter = WhisperEngineAdapter(
       backend: backend, engineMutationScope: .alwaysAllowedForTesting)
     let sid = SessionID()
-    try await adapter.beginSession(sid, options: .default, streaming: false)
+    try await adapter.beginSession(
+      sid, options: TranscriptionOptions(language: "en"), streaming: true)
     feed(adapter, samples: [0.1], session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 1600)])
-    _ = await adapter.finalize(batchSamples: nil)
-    let beforeRetainedCount = adapter.retainedPCMForTests.count
+    _ = await adapter.finalize(batchSamples: [])
+    let tasksBeforeLateFeed = adapter.streamingFeedTasksForUnitTests.count
     feed(adapter, samples: [0.9, 0.9, 0.9], session: sid)
-    #expect(adapter.retainedPCMForTests.count == beforeRetainedCount)
+    await drainStreamingFeeds(adapter)
+    #expect(
+      adapter.streamingFeedTasksForUnitTests.count == tasksBeforeLateFeed,
+      "a post-terminal buffer must not be dispatched")
+    #expect(adapter.streamingPCMForUnitTests.isEmpty, "a post-terminal buffer must not be kept")
   }
 
   @Test(
@@ -339,35 +343,47 @@ import Testing
     let backend = StubWhisperBackend()
     let adapter = WhisperEngineAdapter(
       backend: backend, engineMutationScope: .alwaysAllowedForTesting)
+    await backend.setStreamingSessionFactory({ StubIncrementalSession(result: .accepted(text: "ok")) })
     let sidA = SessionID()
-    try await adapter.beginSession(sidA, options: .default, streaming: false)
+    try await adapter.beginSession(
+      sidA, options: TranscriptionOptions(language: "en"), streaming: true)
     feed(adapter, samples: [0.1, 0.1], session: sidA)
+    let sessionAFeeds = adapter.streamingFeedTasksForUnitTests
     let sidB = SessionID()
-    try await adapter.beginSession(sidB, options: .default, streaming: false)
+    try await adapter.beginSession(
+      sidB, options: TranscriptionOptions(language: "en"), streaming: true)
     // Buffer stamped with the old (sidA) session arrives after the new
-    // beginSession — must be dropped, NOT appended to B's retainedPCM.
+    // beginSession — must be dropped, NOT appended to B's streaming audio.
     feed(adapter, samples: [0.9, 0.9, 0.9], session: sidA)
+    feed(adapter, samples: [0.5, 0.5], session: sidB)
+    for task in sessionAFeeds { await task.value }
+    await drainStreamingFeeds(adapter)
     #expect(
-      adapter.retainedPCMForTests.isEmpty,
-      "stale buffer was appended to fresh session's retainedPCM")
+      adapter.streamingPCMForUnitTests == [Float(0.5), Float(0.5)],
+      "session B keeps only its own audio; the stale buffer was dropped")
   }
 
   // #1307 removed the orphan-worker-cancel path (no worker is ever installed),
   // so the former `beginSessionCancelsOrphanWorker` test no longer applies.
 
-  @Test("acceptAudio is bounded by retainedPCMCap")
+  @Test("streaming audio is bounded by the recording cap")
   func acceptAudioCappedAtMaxRecording() async throws {
     let backend = StubWhisperBackend()
+    await backend.setStreamingSessionFactory({ StubIncrementalSession(result: .accepted(text: "ok")) })
     let adapter = WhisperEngineAdapter(
       backend: backend, engineMutationScope: .alwaysAllowedForTesting)
     let sid = SessionID()
-    try await adapter.beginSession(sid, options: .default, streaming: false)
+    try await adapter.beginSession(
+      sid, options: TranscriptionOptions(language: "en"), streaming: true)
     let cap = Int(TimingConstants.maxRecordingDuration * AudioConstants.sampleRate)
     // Two oversize buffers — the second must be truncated to the cap.
     let big = [Float](repeating: 0.1, count: cap - 100)
     feed(adapter, samples: big, session: sid)
     feed(adapter, samples: [Float](repeating: 0.2, count: 1_000), session: sid)
-    #expect(adapter.retainedPCMForTests.count == cap)
+    await drainStreamingFeeds(adapter)
+    let pcm = adapter.streamingPCMForUnitTests
+    #expect(pcm.count == cap)
+    #expect(pcm.suffix(100).allSatisfy { $0 == Float(0.2) }, "the second buffer fills the cap")
   }
 
   // MARK: observeSpeechSegments
@@ -380,7 +396,7 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     let segments = [SpeechSegment(startSample: 0, endSample: 16_000)]
-    adapter.observeSpeechSegments(segments)
+    adapter.observeSpeechSegments(segments, captureSamples: [])
     #expect(adapter.observedSpeechSegmentsForTests.count == 1)
     await adapter.cancel()
     #expect(adapter.observedSpeechSegmentsForTests.isEmpty)
@@ -407,8 +423,8 @@ import Testing
     // disambiguate, so it trusts the kernel's own `.confirmedNoSpeech` gate
     // (which would have early-returned before reaching `finalize`) and
     // ALWAYS runs ASR. Empty segments simply means "no clipTimestamps".
-    adapter.observeSpeechSegments([])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript (no adapter-side no-speech gate), got \(outcome)")
       return
@@ -434,7 +450,7 @@ import Testing
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
     // Deliberately skip observeSpeechSegments — same semantic as empty
     // segments in the kernel-driven model.
-    let outcome = await adapter.finalize(batchSamples: nil)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -454,8 +470,8 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -476,8 +492,8 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .empty(let hadSpeechEvidence) = outcome else {
       Issue.record("expected .empty, got \(outcome)")
       return
@@ -500,8 +516,8 @@ import Testing
     try await adapter.beginSession(sid, options: .default, streaming: false)
     let samples = speechSamples(count: 16_000)
     feed(adapter, samples: samples, session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: samples)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .empty(let hadSpeechEvidence) = outcome, hadSpeechEvidence else {
       Issue.record("expected .empty(hadSpeechEvidence: true), got \(outcome)")
       return
@@ -517,7 +533,7 @@ import Testing
       backend: backend, engineMutationScope: .alwaysAllowedForTesting)
     try await adapter.beginSession(SessionID(), options: .default, streaming: false)
     await adapter.cancel()
-    let outcome = await adapter.finalize(batchSamples: nil)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .cancelled = outcome else {
       Issue.record("expected .cancelled, got \(outcome)")
       return
@@ -533,8 +549,8 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .cancelled = outcome else {
       Issue.record("expected .cancelled, got \(outcome)")
       return
@@ -552,8 +568,8 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .failed(let kind) = outcome, case .decodeFailed = kind else {
       Issue.record("expected .failed(.decodeFailed), got \(outcome)")
       return
@@ -576,8 +592,8 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000 * 3), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000 * 3)])
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000 * 3)], captureSamples: speechSamples(count: 16_000 * 3))
+    _ = await adapter.finalize(batchSamples: [])
     let opts = await backend.lastTranscribeOptions
     // LID confidence might still abstain depending on classifier thresholds;
     // assert the lastLanguageDetection is set regardless and the language
@@ -599,8 +615,8 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    _ = await adapter.finalize(batchSamples: [])
     let opts = await backend.lastTranscribeOptions
     #expect(opts.language == nil)
   }
@@ -617,8 +633,8 @@ import Testing
     try await adapter.beginSession(sid, options: .default, streaming: false)
     #expect(adapter.lastLanguageDetection == nil)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    _ = await adapter.finalize(batchSamples: [])
     #expect(adapter.lastLanguageDetection != nil)
     await adapter.cancel()
     #expect(adapter.lastLanguageDetection == nil)
@@ -639,8 +655,8 @@ import Testing
     let options = TranscriptionOptions(language: "en")
     try await adapter.beginSession(sid, options: options, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -662,8 +678,8 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -687,8 +703,8 @@ import Testing
     let started = await stubSession.startCount
     #expect(started == 1, "streaming session started for streaming ON + locked")
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -730,8 +746,8 @@ import Testing
     let mss = await backend.makeStreamingSessionCount
     #expect(mss == 0, "auto language never vends a streaming session")
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -761,8 +777,8 @@ import Testing
     try await adapter.beginSession(
       sid, options: TranscriptionOptions(language: "en"), streaming: true)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -793,8 +809,8 @@ import Testing
     try await adapter.beginSession(
       sid, options: TranscriptionOptions(language: "en"), streaming: true)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -840,8 +856,8 @@ import Testing
       sid, options: TranscriptionOptions(language: "en"), streaming: true)
     let recording = speechSamples(count: 16_000)
     feed(adapter, samples: recording, session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: recording)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -874,8 +890,8 @@ import Testing
     let mss = await backend.makeStreamingSessionCount
     #expect(mss == 0, "toggle off never vends a streaming session")
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    let outcome = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript(let result) = outcome else {
       Issue.record("expected .transcript, got \(outcome)")
       return
@@ -891,7 +907,7 @@ import Testing
   // MARK: Finalize — coordinate space (council F1 / OQ-1)
 
   @Test(
-    "batchSamplesIgnored: adapter passes its own retainedPCM-derived samples, not batchSamples (council F1 / OQ-1)"
+    "batchSamplesIgnored: adapter decodes explicitly supplied raw capture samples, ignoring batchSamples (council F1 / OQ-1)"
   )
   func batchSamplesIgnored() async throws {
     let backend = StubWhisperBackend()
@@ -905,9 +921,8 @@ import Testing
     try await adapter.beginSession(sid, options: .default, streaming: false)
     let retained: [Float] = (0..<16_000).map { _ in 0.1 }
     feed(adapter, samples: retained, session: sid)
-    // The 1-arg test overload sets the authoritative capture buffer to the
-    // fed retained PCM (all 0.1).
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
+    // Supply the authoritative capture buffer explicitly (all 0.1).
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: retained)
     // Pass a distinct, easily-identifiable batchSamples — the Whisper
     // adapter MUST ignore `finalize`'s batchSamples and decode the
     // observe-provided capture buffer instead (#827).
@@ -939,8 +954,8 @@ import Testing
       SpeechSegment(startSample: 0, endSample: 8_000),
       SpeechSegment(startSample: 12_000, endSample: 16_000),
     ]
-    adapter.observeSpeechSegments(segments)
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments(segments, captureSamples: speechSamples(count: 16_000))
+    _ = await adapter.finalize(batchSamples: [])
     let opts = await backend.lastTranscribeOptions
     #expect(opts.speechSegments.count == 2)
     #expect(opts.speechSegments[0].startSample == 0)
@@ -988,15 +1003,20 @@ import Testing
     let backend = StubWhisperBackend()
     let adapter = WhisperEngineAdapter(
       backend: backend, engineMutationScope: .alwaysAllowedForTesting)
+    await backend.setStreamingSessionFactory({ StubIncrementalSession(result: .accepted(text: "ok")) })
     let sidA = SessionID()
-    try await adapter.beginSession(sidA, options: .default, streaming: false)
+    try await adapter.beginSession(
+      sidA, options: TranscriptionOptions(language: "en"), streaming: true)
     feed(adapter, samples: [0.1, 0.1], session: sidA)
+    let sessionAFeeds = adapter.streamingFeedTasksForUnitTests
     await adapter.cancel()
     let sidB = SessionID()
-    try await adapter.beginSession(sidB, options: .default, streaming: false)
+    try await adapter.beginSession(
+      sidB, options: TranscriptionOptions(language: "en"), streaming: true)
     feed(adapter, samples: [0.2, 0.2], session: sidB)
-    let pcm = adapter.retainedPCMForTests
-    #expect(pcm == [Float(0.2), Float(0.2)])
+    for task in sessionAFeeds { await task.value }
+    await drainStreamingFeeds(adapter)
+    #expect(adapter.streamingPCMForUnitTests == [Float(0.2), Float(0.2)])
   }
 
   @Test("staleFinalize: a stale finalize during a fresh session does not clobber lastResult")
@@ -1012,8 +1032,8 @@ import Testing
     let sidA = SessionID()
     try await adapter.beginSession(sidA, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sidA)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    async let outcomeA = adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    async let outcomeA = adapter.finalize(batchSamples: [])
     // Signal-wait until finalize actually entered the slow transcribe path,
     // rather than racing a fixed yield budget — `async let` schedules finalize
     // but doesn't guarantee it reached the suspend point (#875;
@@ -1042,8 +1062,8 @@ import Testing
     let sidA = SessionID()
     try await adapter.beginSession(sidA, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sidA)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    async let outcomeA = adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    async let outcomeA = adapter.finalize(batchSamples: [])
     // Signal-wait until finalize entered transcribe (#875).
     await backend.waitForTranscribeCount(1)
     // Session B begins, feeds fresh audio + segments.
@@ -1051,13 +1071,14 @@ import Testing
     try await adapter.beginSession(sidB, options: .default, streaming: false)
     let freshSamples: [Float] = [Float](repeating: 0.42, count: 16_000)
     feed(adapter, samples: freshSamples, session: sidB)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 8_000)])
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 8_000)], captureSamples: freshSamples)
     // The stale finalize resolves while session B is mid-flight.
     _ = await outcomeA
     // Session B's PCM and segments must remain intact — the stale guard must
     // only return, not mutate fresh state.
     #expect(
-      adapter.retainedPCMForTests == freshSamples, "session B's PCM was cleared by stale finalize")
+      adapter.batchCaptureSamplesForUnitTests == freshSamples,
+      "session B's capture audio was cleared by stale finalize")
     #expect(
       adapter.observedSpeechSegmentsForTests.count == 1,
       "session B's observed segments were cleared by stale finalize")
@@ -1143,7 +1164,7 @@ import Testing
     let backend = StubWhisperBackend()
     let adapter = WhisperEngineAdapter(
       backend: backend, engineMutationScope: .alwaysAllowedForTesting)
-    let outcome = await adapter.finalize(batchSamples: nil)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .empty(let hadSpeechEvidence) = outcome, hadSpeechEvidence == false else {
       Issue.record("expected .empty(false), got \(outcome)")
       return
@@ -1168,11 +1189,11 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    _ = await adapter.finalize(batchSamples: [])
     let txCountAfterFirst = await backend.transcribeCount
     // Second finalize on the same terminal session must short-circuit.
-    let outcome = await adapter.finalize(batchSamples: nil)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .empty(let hadSpeechEvidence) = outcome, hadSpeechEvidence == false else {
       Issue.record("expected .empty(false) on re-finalize, got \(outcome)")
       return
@@ -1197,10 +1218,10 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    _ = await adapter.finalize(batchSamples: [])
     // After terminal finalize, late observe must NOT repopulate.
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 99_999)])
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 99_999)], captureSamples: [])
     #expect(
       adapter.observedSpeechSegmentsForTests.isEmpty,
       "post-terminal observeSpeechSegments must be a no-op")
@@ -1216,7 +1237,7 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     await adapter.cancel()
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 99_999)])
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 99_999)], captureSamples: [])
     #expect(
       adapter.observedSpeechSegmentsForTests.isEmpty,
       "post-cancel observeSpeechSegments must be a no-op")
@@ -1228,7 +1249,7 @@ import Testing
   func observeSpeechSegmentsWithoutSessionIsDropped() {
     let adapter = WhisperEngineAdapter(
       backend: StubWhisperBackend(), engineMutationScope: .alwaysAllowedForTesting)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: [])
     #expect(
       adapter.observedSpeechSegmentsForTests.isEmpty,
       "observeSpeechSegments without a live session must be a no-op")
@@ -1246,7 +1267,7 @@ import Testing
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
     // Segments index into `rawCaptureSamples` (the kernel's captureResult.samples),
-    // NOT the adapter's retainedPCM shadow buffer — so they are stored verbatim,
+    // NOT the buffers fed through `acceptAudio` — so they are stored verbatim,
     // no pre-roll shift (#827 reverses the prior shift).
     adapter.observeSpeechSegments(
       [SpeechSegment(startSample: 100, endSample: 15_000)],
@@ -1258,14 +1279,14 @@ import Testing
   }
 
   @Test(
-    "batch decode uses rawCaptureSamples even when it is LONGER than retainedPCM (#827 nil-samples regression)"
+    "batch decode uses rawCaptureSamples even when it is LONGER than the fed audio (#827 nil-samples regression)"
   )
   func batchDecodeUsesCaptureBufferNotShadowPCM() async throws {
     // Reproduces the alternating "Audio samples are nil" shape: the adapter's
-    // async-fed `retainedPCM` is SHORTER than the kernel's authoritative
+    // async-fed buffers are SHORTER than the kernel's authoritative
     // `captureResult.samples`, and a VAD segment runs to the full capture
     // length. The fix decodes the capture buffer (segment in range), not the
-    // shorter shadow buffer (which would overrun → nil).
+    // shorter fed audio (which would overrun → nil).
     let backend = StubWhisperBackend()
     await backend.setTranscribeResult(
       ASRResult(
@@ -1275,14 +1296,14 @@ import Testing
       backend: backend, engineMutationScope: .alwaysAllowedForTesting)
     let sid = SessionID()
     try await adapter.beginSession(sid, options: .default, streaming: false)
-    // Shadow buffer (retainedPCM): 16_000 samples of 0.1, fed async.
+    // Fed audio: 16_000 samples of 0.1, through `acceptAudio`.
     feed(adapter, samples: [Float](repeating: 0.1, count: 16_000), session: sid)
     // Authoritative capture buffer: LONGER (24_000) and a distinct value, with
     // a segment running to its full length.
     let capture = [Float](repeating: 0.5, count: 24_000)
     adapter.observeSpeechSegments(
       [SpeechSegment(startSample: 0, endSample: 24_000)], rawCaptureSamples: capture)
-    let outcome = await adapter.finalize(batchSamples: nil)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .transcript = outcome else {
       Issue.record("expected .transcript (no nil-samples failure), got \(outcome)")
       return
@@ -1290,9 +1311,9 @@ import Testing
     let lastSamples = await backend.lastTranscribeSamples
     #expect(
       lastSamples.count == 24_000,
-      "decode must use the 24_000-sample capture buffer, not the 16_000 shadow PCM")
+      "decode must use the 24_000-sample capture buffer, not the 16_000 fed samples")
     #expect(
-      lastSamples.first == Float(0.5), "decoded the capture buffer (0.5), not retainedPCM (0.1)")
+      lastSamples.first == Float(0.5), "decoded the capture buffer (0.5), not the fed audio (0.1)")
   }
 
   @Test(
@@ -1330,8 +1351,8 @@ import Testing
         text: "done", language: "en", duration: 1, processingTime: 0.1,
         backendType: .whisper))
     feed(adapter, samples: speechSamples(count: 16_000), session: sidA)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    _ = await adapter.finalize(batchSamples: [])
     // Now apply policy in the terminal A state — armed unload task starts.
     adapter.applyUnloadPolicy(.immediately)
     // Capture A's armed task with a synchronous read (no MainActor yield), so
@@ -1426,9 +1447,9 @@ import Testing
     try await adapter.beginSession(
       sid, options: TranscriptionOptions(language: "en"), streaming: true)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
 
-    let outcome = await adapter.finalize(batchSamples: nil)
+    let outcome = await adapter.finalize(batchSamples: [])
     guard case .failed = outcome else {
       Issue.record("expected the internal clean-batch fallback to also fail, got \(outcome)")
       return
@@ -1478,8 +1499,8 @@ import Testing
     try await adapter.beginSession(
       sid, options: TranscriptionOptions(language: nil), streaming: false)
     feed(adapter, samples: speechSamples(count: 16_000), session: sid)
-    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)])
-    _ = await adapter.finalize(batchSamples: nil)
+    adapter.observeSpeechSegments([SpeechSegment(startSample: 0, endSample: 16_000)], captureSamples: speechSamples(count: 16_000))
+    _ = await adapter.finalize(batchSamples: [])
 
     let lidCountAfterFirstAttempt = await backend.observeLIDCount
     #expect(lidCountAfterFirstAttempt > 0, "precondition: the auto-language first attempt ran LID")
@@ -1538,6 +1559,12 @@ import Testing
         buffer: buffer, frameCount: samples.count, sequence: 1, sessionID: session))
   }
 
+  /// Await every streaming-feed task the adapter has dispatched, so assertions
+  /// read `streamingPCM` after the subject finished appending.
+  private func drainStreamingFeeds(_ adapter: WhisperEngineAdapter) async {
+    for task in adapter.streamingFeedTasksForUnitTests { await task.value }
+  }
+
   /// 16 kHz mono Float32 samples with small non-zero amplitude (so VAD-derived
   /// LID padded samples never collapse to silence padding).
   private func speechSamples(count: Int) -> [Float] {
@@ -1549,18 +1576,11 @@ import Testing
 // MARK: - Test-only inspectors on the adapter
 
 extension WhisperEngineAdapter {
-  var retainedPCMForTests: [Float] { retainedPCMForUnitTests }
   var observedSpeechSegmentsForTests: [SpeechSegment] { observedSpeechSegmentsForUnitTests }
 
-  /// Test-only convenience that calls the production
-  /// `observeSpeechSegments(_:rawCaptureSamples:)` with `rawCaptureSamples` set
-  /// to the adapter's current retained PCM — so lifecycle/storage tests that
-  /// fed audio via `acceptAudio` decode that same audio without supplying a
-  /// separate capture buffer. Tests that exercise the #827 fix (segments
-  /// indexing a capture buffer longer than retained PCM) use the two-arg
-  /// signature directly. Production callers (the kernel) always pass
-  /// `captureResult.samples`.
-  func observeSpeechSegments(_ segments: [SpeechSegment]) {
-    observeSpeechSegments(segments, rawCaptureSamples: retainedPCMForUnitTests)
+  /// Supply fixture-owned capture audio explicitly, as the kernel supplies
+  /// `captureResult.samples` in production.
+  func observeSpeechSegments(_ segments: [SpeechSegment], captureSamples: [Float]) {
+    observeSpeechSegments(segments, rawCaptureSamples: captureSamples)
   }
 }
