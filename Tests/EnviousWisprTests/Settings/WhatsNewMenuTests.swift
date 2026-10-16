@@ -26,7 +26,7 @@ struct WhatsNewMenuTests {
 
   @Test("The settings announcement leads the menu")
   func settingsAnnouncementLeads() throws {
-    let entry = try #require(WhatsNewMenuPresentation.entries().first)
+    let entry = try #require(WhatsNewMenuPresentation.entries(version: "2.5.3").first)
     #expect(entry.id == "settings-easier-to-find")
     // Founder 2026-10-07: the 2.5.3 note names the redesign and search only; the old -> new
     // path table moved to the help article (#3456), so the menu entry carries no list.
@@ -91,12 +91,12 @@ struct WhatsNewMenuTests {
     presentation.requestOpen()
     presentation.didOpen(settings: settings)
     #expect(settings.hasUnreadWhatsNew == false)
-    #expect(defaults.string(forKey: WhatsNewConstants.lastSeenVersionDefaultsKey) == "2.5.3")
+    #expect(defaults.string(forKey: WhatsNewConstants.lastSeenVersionDefaultsKey) == "2.5.4")
     presentation.dismiss()
     #expect(presentation.isPresented == false)
     presentation.requestOpen()
     presentation.didOpen(settings: settings)
-    #expect(settings.lastSeenWhatsNewVersion == "2.5.3")
+    #expect(settings.lastSeenWhatsNewVersion == "2.5.4")
   }
 
   @Test("Update copy states only what the availability service knows")
