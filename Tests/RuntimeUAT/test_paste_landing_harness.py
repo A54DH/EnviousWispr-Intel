@@ -14,7 +14,13 @@ clipboard), reads an exact paste as ok and an empty, truncated or doubled one as
 cleanup parsers keep checked (PR B) and unchecked (#3304 recorded window) lines apart; a sleeping proof on an awake or unreadable Chrome is INCONCLUSIVE, never PASS, and a run
 with one exits 3, while a proven failure still exits 1; step 0 fails a paste that also showed
 Copied; a doubled paste is not a single insertion; the push-to-talk key is released after the
-before-release callback, even when that callback raises.
+before-release callback, even when that callback raises. #3802: the wake phase's warmup-line
+parser refuses the old line shape; its dev-app launcher refuses two candidates and never passes an
+inherited suppression on; the sleeping phases' wrapper always restores a normal launch unless a take
+may still be live, including when the suppressed launch itself fails, and every relaunch
+refuses to continue without its own launch line; the driver targets the dev app by verified path,
+never a same-name sibling; a staging failure still closes its Chrome; a doubled wake take is not an
+exact insertion.
 """
 import os
 import pathlib
@@ -528,6 +534,272 @@ class LauncherHarness(unittest.TestCase):
         finally:
             h.FIXTURE.clear()
             h.FIXTURE.update(saved)
+
+
+class WakeHarness(unittest.TestCase):
+    """#3802: the wake phase's parser, its dev-app launcher and the sleeping phases' suppression
+    wrapper, with every process, signal and log read scripted. No app, Chrome, screen or key."""
+
+    NEW = "[INFO] [AccessibilityWarmup] AXWarmup prime pid=4242 role=0 found=false"
+    OLD = "[INFO] [AccessibilityWarmup] AXWarmup prime pid=4242 found=true"
+
+    def setUp(self):
+        self.saved = {name: getattr(h, name) for name in
+                      ("dev_app_candidates", "relaunch_dev_app", "connect_dev_app", "stop_dev_app",
+                       "launch_dev_app", "SleepingChrome")}
+        self.saved_w = {name: getattr(h.w, name) for name in ("_pid", "_app", "get_ax_app")}
+        import ui_helpers
+        self.ui_helpers = ui_helpers
+        self.saved_ready = ui_helpers.validate_app_ready
+        self.saved_u = {name: getattr(h.u, name) for name in ("log_size", "log_since", "wait_for")}
+        self.saved_popen = h.subprocess.Popen
+        self.saved_connect = h.w.connect
+        self.saved_env = os.environ.get(h.SKIP_WARMUP_ENV)
+        self.saved_stuck = h.TAKE_STUCK["stuck"]
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(h, name, value)
+        for name, value in self.saved_u.items():
+            setattr(h.u, name, value)
+        h.subprocess.Popen = self.saved_popen
+        h.w.connect = self.saved_connect
+        if self.saved_env is None:
+            os.environ.pop(h.SKIP_WARMUP_ENV, None)
+        else:
+            os.environ[h.SKIP_WARMUP_ENV] = self.saved_env
+        h.TAKE_STUCK["stuck"] = self.saved_stuck
+        for name, value in self.saved_w.items():
+            setattr(h.w, name, value)
+        self.ui_helpers.validate_app_ready = self.saved_ready
+
+    def test_warmup_parser_reads_the_new_line_and_not_the_old_one(self):
+        self.assertEqual(h.warmup_lines(self.NEW), [(4242, 0, False)])
+        self.assertEqual(h.warmup_lines("AXWarmup prime pid=7 role=-25204 found=false"),
+                         [(7, -25204, False)])
+        # Two-way control: the pre-#3802 line carries no role, so it can never prove a wake.
+        self.assertEqual(h.warmup_lines(self.OLD), [])
+
+    def test_wake_phase_is_registered_and_sleeping_phases_are_wrapped(self):
+        self.assertIn("wake", h.PHASES)
+        self.assertEqual(set(h.SLEEPING_PHASES),
+                         {"sleeping", "sleepingswitch", "sleepingclosed", "sleepingstay"})
+        self.assertTrue(set(h.SLEEPING_PHASES) <= set(h.PHASES))
+
+    def test_stop_refuses_to_choose_between_two_dev_apps(self):
+        h.dev_app_candidates = lambda: [101, 202]
+        with self.assertRaises(h.u.Aborted):
+            h.stop_dev_app("probe")
+
+    def test_stop_with_nothing_running_is_done(self):
+        h.dev_app_candidates = lambda: []
+        self.assertTrue(h.stop_dev_app("probe"))
+
+    def launched_env(self, skip):
+        calls = []
+        running = iter([[], [999], [999]])
+        h.dev_app_candidates = lambda: next(running)
+        h.u.log_size = lambda: 0
+        h.u.wait_for = lambda what, predicate, deadline=10.0, poll=0.1: predicate()
+        h.connect_dev_app = lambda label: None
+
+        def fake_popen(argv, env=None, **kwargs):
+            calls.append((argv, env))
+        h.subprocess.Popen = fake_popen
+        h.launch_dev_app("probe", skip_warmup=skip)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], [h.dev_app_executable()])
+        return calls[0][1]
+
+    def test_normal_launch_drops_an_inherited_suppression(self):
+        os.environ[h.SKIP_WARMUP_ENV] = "1"
+        self.assertNotIn(h.SKIP_WARMUP_ENV, self.launched_env(skip=False))
+
+    def test_suppressed_launch_sets_exactly_one(self):
+        os.environ.pop(h.SKIP_WARMUP_ENV, None)
+        self.assertEqual(self.launched_env(skip=True)[h.SKIP_WARMUP_ENV], "1")
+
+    def test_launch_refuses_while_the_app_still_runs(self):
+        h.dev_app_candidates = lambda: [999]
+        with self.assertRaises(h.u.Aborted):
+            h.launch_dev_app("probe", skip_warmup=False)
+
+    def test_wrapper_restores_a_normal_launch_even_when_the_phase_raises(self):
+        calls = []
+        h.relaunch_dev_app = lambda label, skip_warmup: calls.append(skip_warmup)
+
+        def phase():
+            raise h.u.Aborted("phase failed")
+        with self.assertRaises(h.u.Aborted):
+            h.with_warmup_suppressed("sleeping", phase)
+        self.assertEqual(calls, [True, False])
+
+    def test_wrapper_leaves_the_app_alone_while_a_take_may_be_live(self):
+        calls = []
+        h.relaunch_dev_app = lambda label, skip_warmup: calls.append(skip_warmup)
+
+        def phase():
+            h.TAKE_STUCK["stuck"] = True
+        with Results() as results:
+            h.with_warmup_suppressed("sleeping", phase)
+            statuses = [status for _, status, _ in results]
+        self.assertEqual(calls, [True])
+        self.assertIn("FAIL", statuses)
+
+    def test_wrapper_restores_when_the_suppressed_launch_itself_fails(self):
+        calls = []
+
+        def relaunch(label, skip_warmup):
+            calls.append(skip_warmup)
+            if skip_warmup:
+                raise h.u.Aborted("no suppression line")
+        h.relaunch_dev_app = relaunch
+        ran = []
+        with self.assertRaises(h.u.Aborted):
+            h.with_warmup_suppressed("sleeping", lambda: ran.append(True))
+        self.assertEqual(ran, [])
+        self.assertEqual(calls, [True, False])
+
+    def test_relaunch_refuses_without_its_launch_proof(self):
+        h.stop_dev_app = lambda label: True
+        h.launch_dev_app = lambda label, skip_warmup: 0
+        h.u.log_since = lambda offset: "no warmup line at all"
+        h.u.wait_for = lambda what, predicate, deadline=10.0, poll=0.1: predicate()
+        with Results():
+            with self.assertRaises(h.u.Aborted):
+                h.relaunch_dev_app("probe", skip_warmup=True)
+            with self.assertRaises(h.u.Aborted):
+                h.relaunch_dev_app("probe", skip_warmup=False)
+
+    def test_relaunch_normal_refuses_a_launch_that_logged_suppression(self):
+        h.stop_dev_app = lambda label: True
+        h.launch_dev_app = lambda label, skip_warmup: 0
+        h.u.log_since = lambda offset: h.WARMUP_OFF + "\n" + self.NEW
+        h.u.wait_for = lambda what, predicate, deadline=10.0, poll=0.1: predicate()
+        with Results():
+            with self.assertRaises(h.u.Aborted):
+                h.relaunch_dev_app("probe", skip_warmup=False)
+
+    def test_driver_targets_the_verified_dev_app_never_a_same_name_sibling(self):
+        h.w._pid = 1  # a same-name sibling the name lookup would have found
+        h.w.get_ax_app = lambda pid: f"ax-{pid}"
+        self.ui_helpers.validate_app_ready = lambda pid: (True, "ok")
+        h.dev_app_candidates = lambda: [555]
+        h.connect_dev_app("probe")
+        self.assertEqual((h.w._pid, h.w._app), (555, "ax-555"))
+        for pids in ([], [555, 556]):
+            h.dev_app_candidates = lambda pids=pids: pids
+            with self.assertRaises(h.u.Aborted):
+                h.connect_dev_app("probe")
+        h.dev_app_candidates = lambda: [555]
+        self.ui_helpers.validate_app_ready = lambda pid: (False, "no window")
+        with self.assertRaises(h.u.Aborted):
+            h.connect_dev_app("probe")
+
+    def test_a_staging_failure_after_chrome_started_still_closes_it(self):
+        closed = []
+
+        class FakeChrome:
+            def __init__(self, label):
+                self.pid = 777
+
+            def open(self, url):
+                pass
+
+            def front(self):
+                raise h.u.Aborted("did not come front")
+
+            def close(self):
+                closed.append(True)
+                return True
+        h.SleepingChrome = FakeChrome
+        h.stop_dev_app = lambda label: True
+        saved_sleep = h.time.sleep
+        h.time.sleep = lambda s: None
+        try:
+            with Results():
+                with self.assertRaises(h.u.Aborted):
+                    h.stage_wake_arm("probe")
+        finally:
+            h.time.sleep = saved_sleep
+            path = f"/tmp/ew-uat-3802-wake-probe-{h.u.RUN_ID}.html"
+            if os.path.exists(path):
+                os.remove(path)
+        self.assertEqual(closed, [True])
+
+    def test_notice_frames_come_from_the_recording_at_the_logged_notice(self):
+        text = ("[2026-10-15T19:00:00-04:00] [INFO] [Paste] RETAINED_NOTICE take=A shown=false why=x\n"
+                "[2026-10-15T19:00:05-04:00] [INFO] [Paste] RETAINED_NOTICE take=A shown=true why=kept\n")
+        from datetime import datetime
+        when = datetime.fromisoformat("2026-10-15T19:00:05-04:00").timestamp()
+        self.assertEqual(h.notice_epoch(text), when)
+        self.assertIsNone(h.notice_epoch("no notice here"))
+        asked = []
+
+        class Clip:
+            exists = True
+            started_at = when - 3.0
+            path = "/tmp/clip.mov"
+
+            def frame_at(self, offset, save_path=None):
+                asked.append(round(offset, 1))
+                return save_path
+        self.assertEqual(len(h.notice_frames(Clip(), text, "probe")), 7)
+        self.assertEqual(asked, [2.5, 3.2, 4.0, 4.8, 5.5, 6.2, 7.0])
+        # Two-way: no recording, or no notice line, gives no frames rather than a guess.
+        Clip.exists = False
+        self.assertEqual(h.notice_frames(Clip(), text, "probe"), [])
+        Clip.exists = True
+        self.assertEqual(h.notice_frames(Clip(), "nothing", "probe"), [])
+
+    def prove(self, label, started_offset, log_texts):
+        """Run prove_woke with Chrome already readable and the log answering `log_texts` in turn."""
+        saved_focus = h.chrome_focus
+        h.chrome_focus = lambda pid: ("AXTextArea", "")
+        texts = iter(log_texts)
+        last = {"t": ""}
+
+        def log_since(offset):
+            last["t"] = next(texts, last["t"])
+            return last["t"]
+        h.u.log_since = log_since
+        h.u.wait_for = lambda what, predicate, deadline=10.0, poll=0.1: predicate() or predicate()
+
+        class Chrome:
+            pid = 4242
+        try:
+            with Results() as results:
+                ok = h.prove_woke(label, Chrome(), 0, h.time.monotonic() - started_offset)
+                statuses = {name: status for name, status, _ in results}
+        finally:
+            h.chrome_focus = saved_focus
+        return ok, statuses
+
+    def test_b1_start_up_that_uses_the_window_is_inconclusive_not_a_failure(self):
+        ok, statuses = self.prove("wake-b1", 3.0, [self.NEW])
+        self.assertTrue(ok)
+        self.assertEqual(statuses.get("wake-b1: wake timing"), "INCONCLUSIVE")
+        self.assertNotIn("FAIL", statuses.values())
+
+    def test_b2_over_the_window_still_fails(self):
+        ok, statuses = self.prove("wake-b2", 3.0, [self.NEW])
+        self.assertEqual(statuses.get("wake-b2: readable within two seconds"), "FAIL")
+
+    def test_a_warmup_line_that_lands_after_the_wake_still_counts(self):
+        ok, statuses = self.prove("wake-b2", 0.0, ["", "", self.NEW])
+        self.assertTrue(ok)
+        self.assertEqual(statuses.get("wake-b2: this launch sent the role read to this Chrome (role=0)"),
+                         "PASS")
+
+    def test_exact_insertion_rejects_a_doubled_wake_take(self):
+        log = ("[x] [INFO] [Pipeline] CORRECTION_DEBUG [LLM Polish] OUT: Quick async update for the "
+               "team, I just wrapped up with sales.\n")
+        once = "Quick async update for the team, I just wrapped up with sales."
+        with Results() as results:
+            h.verify_exact("wake-found", once, log, h.WAKE_SENTENCE)
+            h.verify_exact("wake-found", once + " " + once, log, h.WAKE_SENTENCE)
+            statuses = [status for _, status, _ in results]
+        self.assertEqual(statuses, ["PASS", "PASS", "PASS", "FAIL"])
 
 
 if __name__ == "__main__":
