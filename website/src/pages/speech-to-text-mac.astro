@@ -140,13 +140,13 @@ const faqJsonLd = JSON.stringify({
         <div class="split-card reveal">
           <h3>Parakeet TDT v3</h3>
           <p>
-            The default. Runs on the Apple Neural Engine. Fastest of the two and the reason the median lands under a second. Covers 25 European languages, and you pick the language yourself: this engine does not detect it for you.
+            The default. Runs on the Apple Neural Engine. Fastest of the two and the reason the median lands under a second. Covers 25 European languages and detects which of them you are speaking.
           </p>
         </div>
         <div class="split-card reveal">
-          <h3>WhisperKit</h3>
+          <h3>Whisper Large v3 Turbo</h3>
           <p>
-            Runs on the GPU. Slower than Parakeet, covers 99+ languages, and this is the one that detects the language automatically. Switch to it in settings when you need a language Parakeet does not carry, or when you move between languages without wanting to set one.
+            Runs on the GPU. Slower than Parakeet, covers 99+ languages, and detects which of them you are speaking. Switch to it in settings when you need a language Parakeet does not carry.
           </p>
         </div>
       </div>
@@ -219,7 +219,7 @@ const faqJsonLd = JSON.stringify({
       <div class="honesty reveal">
         <h2>Constraints</h2>
         <ul>
-          <li><strong>Apple Silicon only.</strong> M1 or later. There is no Intel build and there will not be one; the speed comes from the Neural Engine.</li>
+          <li><strong>Apple Silicon only.</strong> M1 or later. There is no Intel build and there will not be one; the speed comes from the Neural Engine and GPU in Apple Silicon.</li>
           <li><strong>macOS 14 Sonoma or later.</strong> Core dictation works across that whole range.</li>
           <li><strong>Apple Intelligence cleanup needs macOS 26.</strong> Third-party apps could not call the on-device model before that. Apple Intelligence is also the shipped default, so on macOS 14 to 25 the cleanup step is skipped silently and you get the deterministically cleaned text rather than raw output. There is no automatic fallback: to get AI cleanup below macOS 26 you pick EG-1, S1-mini by Superwhisper, a local Ollama model, or your own provider key yourself.</li>
           <li><strong>No Windows, Linux, iOS, or Android version.</strong> If you need those, <a href="/compare/handy/">Handy</a> is free, open source, and cross-platform.</li>

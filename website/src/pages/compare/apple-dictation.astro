@@ -52,7 +52,7 @@ const faqs = [
   },
   {
     "q": "What Mac do I need?",
-    "a": "Any Mac with Apple Silicon (M1 or later) running macOS 14 Sonoma or newer. The Neural Engine on Apple Silicon is what makes on-device transcription fast."
+    "a": "Any Mac with Apple Silicon (M1 or later) running macOS 14 Sonoma or newer. The Neural Engine and GPU on Apple Silicon are what make on-device transcription fast."
   },
   {
     "q": "Can I use both Apple Dictation and EnviousWispr at the same time?",
@@ -307,7 +307,7 @@ const faqs = [
           </tr>
           <tr>
             <td>Audio processing</td>
-            <td><span class="table-highlight">On-device</span> (<a href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3" style="color: var(--accent); text-decoration: underline;">Parakeet TDT</a> + <a href="https://github.com/argmaxinc/argmax-oss-swift" style="color: var(--accent); text-decoration: underline;">WhisperKit</a>)</td>
+            <td><span class="table-highlight">On-device</span> (<a href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3" style="color: var(--accent); text-decoration: underline;">Parakeet TDT</a> + <a href="https://huggingface.co/openai/whisper-large-v3-turbo" style="color: var(--accent); text-decoration: underline;">Whisper</a>)</td>
             <td>On-device (Apple Silicon); cloud fallback on Intel</td>
           </tr>
           <tr>
@@ -377,7 +377,7 @@ const faqs = [
           </tr>
           <tr>
             <td>Language support</td>
-            <td>25 European (Parakeet), 99+ languages via WhisperKit</td>
+            <td>25 European (Parakeet), 99+ languages via Whisper</td>
             <td>Dozens of locales</td>
           </tr>
           <tr>
@@ -440,7 +440,7 @@ const faqs = [
       <div class="advantage-card reveal">
         <div class="advantage-icon">⚡</div>
         <div class="advantage-title">0.61s to finished text</div>
-        <p class="advantage-desc">Median time from end of speech to transcribed text: 0.61 seconds. Processed locally on the <a href="https://developer.apple.com/machine-learning/core-ml/" style="color: var(--accent); text-decoration: underline;">Neural Engine</a>, no network dependency. AI polish, when enabled, adds variable time on top that scales with how much you dictated.</p>
+        <p class="advantage-desc">Median time from end of speech to transcribed text: 0.61 seconds. Processed locally on the Neural Engine or GPU, no network dependency. AI polish, when enabled, adds variable time on top that scales with how much you dictated.</p>
       </div>
       <div class="advantage-card reveal">
         <div class="advantage-icon">🔇</div>
@@ -607,7 +607,7 @@ const faqs = [
       </div>
       <div class="faq-item reveal">
         <div class="faq-q">What Mac do I need?</div>
-        <p class="faq-a">Any Mac with Apple Silicon (M1 or later) running macOS 14 Sonoma or newer. The Neural Engine on Apple Silicon is what makes on-device transcription fast. See the <a href="/blog/getting-started-enviouswispr-under-2-minutes/" style="color: var(--accent); text-decoration: underline;">2-minute getting started guide</a>.</p>
+        <p class="faq-a">Any Mac with Apple Silicon (M1 or later) running macOS 14 Sonoma or newer. The Neural Engine and GPU on Apple Silicon are what make on-device transcription fast. See the <a href="/blog/getting-started-enviouswispr-under-2-minutes/" style="color: var(--accent); text-decoration: underline;">2-minute getting started guide</a>.</p>
       </div>
       <div class="faq-item reveal">
         <div class="faq-q">Can I use both Apple Dictation and EnviousWispr at the same time?</div>
