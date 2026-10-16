@@ -518,6 +518,14 @@ package actor TranscribeCppWhisperBackend<Driver: WhisperExecutorDriving>: ASRBa
   static var silencePaddingSamples: Int { 8_000 }
   static var sampleRate: Int { 16_000 }
 
+  /// #3801: one counts-only line per decode that removed trailing segments; never any text.
+  static func logSilentTail(_ dropped: Int, route: String) async {
+    guard dropped > 0 else { return }
+    await AppLogger.shared.log(
+      "whisper_silent_tail dropped=\(dropped) route=\(route)", level: .info,
+      category: "TranscribeCppWhisper")
+  }
+
   package func transcribe(
     audioSamples: [Float], options: TranscriptionOptions,
     onInferenceEntered inferenceObserver: ASRInferenceEntryObserver? = nil
@@ -569,9 +577,17 @@ package actor TranscribeCppWhisperBackend<Driver: WhisperExecutorDriving>: ASRBa
       }
       throw mapped
     }
+    // #3801: remove trailing segments classified as lacking sufficient acoustic support.
+    // Statistics and the voice test read the FULL capture; the envelope can be nearly all speech.
+    let tail = WhisperSilentTailFilter.filter(
+      run, statsSamples: audioSamples, segmentOffsetSamples: envelope.lowerBound,
+      realEndSample: envelope.upperBound)
+    await Self.logSilentTail(tail.dropped, route: "batch")
     let elapsed = ContinuousClock.now - start
+    var filtered = tail.result
+    filtered.silentTailDropped = tail.dropped
     return Self.mapResult(
-      run, languageHint: options.language, envelope: envelope,
+      filtered, languageHint: options.language, envelope: envelope,
       originalSampleCount: audioSamples.count,
       processingTime: Double(elapsed / .milliseconds(1)) / 1000,
       enableTimestamps: options.enableTimestamps)
@@ -640,7 +656,8 @@ package actor TranscribeCppWhisperBackend<Driver: WhisperExecutorDriving>: ASRBa
       text: text, language: language,
       duration: Double(originalSampleCount) / Double(sampleRate),
       processingTime: processingTime, backendType: .whisper,
-      wordTimings: nil, wordTimingCoverage: nil, segmentTimings: segmentTimings)
+      wordTimings: nil, wordTimingCoverage: nil, segmentTimings: segmentTimings,
+      silentTailDropped: run.silentTailDropped)
   }
 
   /// Binds each segment's text to its UTF-16 range in `text`, in order, and restores its
@@ -798,7 +815,14 @@ package actor TranscribeCppWhisperBackend<Driver: WhisperExecutorDriving>: ASRBa
       let run = try await driver.transcribe(
         handle, samples: input, language: language, lane: .heart,
         onInferenceEntered: onDecode, onProgress: nil)
-      return run
+      // #3801: the loop and the flush both decode here, so both only ever see filtered
+      // results. Nothing below throws, so the catch still sees only the native call's errors.
+      let tail = WhisperSilentTailFilter.filter(
+        run, statsSamples: samples, segmentOffsetSamples: 0, realEndSample: samples.count)
+      await Self.logSilentTail(tail.dropped, route: "rolling")
+      var filtered = tail.result
+      filtered.silentTailDropped = tail.dropped
+      return filtered
     } catch {
       let mapped = Self.mapRunError(error)
       if mapped is CancellationError { await driver.waitForDrain(handle) }
