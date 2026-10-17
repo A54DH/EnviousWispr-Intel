@@ -259,7 +259,7 @@ actor ApplePreviewRecognizer: LivePreviewEngine {
   /// so this file's own callers and tests are unaffected; this only boxes it in the
   /// handle the coordinator can hold without naming Apple.
   func openSession(
-    lookups: WordCorrector.Lookups?,
+    vocabulary: LivePreviewVocabulary,
     onText: @escaping @Sendable (String) -> Void
   ) async throws -> any LivePreviewEngineSession {
     // **Re-assert the reservation here, not only in `prepare()`.**
@@ -281,9 +281,11 @@ actor ApplePreviewRecognizer: LivePreviewEngine {
     // Claiming also REGISTERS this session's use, atomically, so the claim cannot be evicted
     // between being taken and being used. Released in `ApplePreviewSessionHandle.end()`, which the
     // coordinator always calls.
+    let inputs = ApplePreviewHints.inputs(for: vocabulary)
     try await LocaleClaims.shared.claim(locale, purpose: "session")
     do {
-      let session = try await startSession(lookups: lookups, onText: onText)
+      let session = try await startSession(
+        lookups: inputs.lookups, contextualPhrases: inputs.phrases, onText: onText)
       return ApplePreviewSessionHandle(
         recognizer: self, session: session, claimedLocale: locale)
     } catch {
@@ -306,7 +308,8 @@ actor ApplePreviewRecognizer: LivePreviewEngine {
   /// rather than ordering two awaits, which is the same lesson the `Session` value
   /// above already encodes: shared mutable state on this actor is the bug.
   func startSession(
-    lookups: WordCorrector.Lookups?, onText: @escaping @Sendable (String) -> Void
+    lookups: WordCorrector.Lookups?, contextualPhrases: [String],
+    onText: @escaping @Sendable (String) -> Void
   ) async throws -> Session {
     guard let target = targetFormat, let source = sourceFormat else {
       throw LivePreviewError.notPrepared
@@ -314,6 +317,52 @@ actor ApplePreviewRecognizer: LivePreviewEngine {
     currentToken &+= 1
     let token = currentToken
 
+    await AppLogger.shared.log(
+      "LIVE_PREVIEW hints requested count=\(contextualPhrases.count)", category: "LivePreview")
+    // Superseded while `start` was suspended: this session's resources are ours
+    // alone, so close them rather than handing back something whose every later
+    // call would be rejected.
+    let opening = try await ApplePreviewSessionSetup.start(
+      phrases: contextualPhrases,
+      make: {
+        try makeStartResources(source: source, target: target, lookups: lookups, onText: onText)
+      },
+      attach: { opening, phrases in
+        let context = AnalysisContext()
+        context.contextualStrings[.general] = phrases
+        try await opening.analyzer.setContext(context)
+        await AppLogger.shared.log(
+          "LIVE_PREVIEW hints configured count=\(phrases.count)", category: "LivePreview")
+      },
+      start: { opening in
+        try await opening.analyzer.start(inputSequence: opening.stream)
+      },
+      discard: { opening in await discardStartResources(opening) },
+      isCurrent: { currentToken == token },
+      contextFailed: { error in
+        await AppLogger.shared.log(
+          "LIVE_PREVIEW hints unavailable count=\(contextualPhrases.count) errorType=\(String(reflecting: type(of: error)))",
+          category: "LivePreview")
+      })
+    return Session(
+      token: token, analyzer: opening.analyzer, continuation: opening.continuation,
+      collector: opening.collector,
+      converter: opening.converter, sourceFormat: source, targetFormat: target,
+      fedAnyAudio: FedFlag())
+  }
+
+  private struct StartResources: Sendable {
+    let analyzer: SpeechAnalyzer
+    let stream: AsyncStream<AnalyzerInput>
+    let continuation: AsyncStream<AnalyzerInput>.Continuation
+    let collector: Task<Void, Never>
+    let converter: AVAudioConverter?
+  }
+
+  private func makeStartResources(
+    source: AVAudioFormat, target: AVAudioFormat, lookups: WordCorrector.Lookups?,
+    onText: @escaping @Sendable (String) -> Void
+  ) throws -> StartResources {
     // A fresh converter per session, so no resampler tail crosses a boundary and
     // leaks the previous dictation's audio into this one.
     //
@@ -346,35 +395,21 @@ actor ApplePreviewRecognizer: LivePreviewEngine {
     // The session owns the vocabulary it started with.
     let collector = Self.collect(from: module, lookups: lookups, onText: onText)
 
-    // Finishing the stream and cancelling the collector is not enough: the analyzer
-    // holds its own analysis and model resources and needs an explicit end, or a
-    // rapid stop-start loop accumulates abandoned ones. `cancelAndFinishNow` rather
-    // than `finalizeAndFinishThroughEndOfInput` because this session is being thrown
-    // away — there is no result anyone will read, and finalizing an analyzer that
-    // never received input does not return (trap 2).
-    func discard() async {
-      continuation.finish()
-      collector.cancel()
-      await analyzer.cancelAndFinishNow()
-    }
+    return StartResources(
+      analyzer: analyzer, stream: stream, continuation: continuation,
+      collector: collector, converter: converter)
+  }
 
-    do {
-      try await analyzer.start(inputSequence: stream)
-    } catch {
-      await discard()
-      throw error
-    }
-    // Superseded while `start` was suspended: this session's resources are ours
-    // alone, so close them rather than handing back something whose every later
-    // call would be rejected.
-    guard token == currentToken else {
-      await discard()
-      throw LivePreviewError.superseded
-    }
-    return Session(
-      token: token, analyzer: analyzer, continuation: continuation, collector: collector,
-      converter: converter, sourceFormat: source, targetFormat: target,
-      fedAnyAudio: FedFlag())
+  // Finishing the stream and cancelling the collector is not enough: the analyzer
+  // holds its own analysis and model resources and needs an explicit end, or a
+  // rapid stop-start loop accumulates abandoned ones. `cancelAndFinishNow` rather
+  // than `finalizeAndFinishThroughEndOfInput` because this session is being thrown
+  // away — there is no result anyone will read, and finalizing an analyzer that
+  // never received input does not return (trap 2).
+  private func discardStartResources(_ opening: StartResources) async {
+    opening.continuation.finish()
+    opening.collector.cancel()
+    await opening.analyzer.cancelAndFinishNow()
   }
 
   /// Accumulate results into the text a user would actually be looking at.
