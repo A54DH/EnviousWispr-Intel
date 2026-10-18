@@ -233,7 +233,8 @@ enum PillCatalog {
     case .accessibilityToast:
       return notice(
         id: id, kind: .accessibilityToast, text: DictationNarrator.accessibilityToastText,
-        width: .fixed(300), fixedHeight: 56,  // :859 and :1118 both pass height: 56
+        // #3912: keeps its 300 width (the Grant button) and takes its height from the text.
+        width: .fixed(300),  // was 300 x 56 (:859, :1118)
         expiry: .after(seconds: 6), isMultiline: true,
         action: NoticeAction(
           label: String(
@@ -246,10 +247,9 @@ enum PillCatalog {
     case .warning(let reason):
       return notice(
         id: id, kind: .notification, text: DictationNarrator.copy(for: reason),
-        // A single-line notification is NOT `fitToContent`, so it takes
-        // `showPanel`'s own `height: 44` default and keeps the 280x44 box.
-        width: .fixed(280), fixedHeight: 44,
-        expiry: .after(seconds: 2.5), severity: .warning)  // NotificationStyle 2.5
+        // #3912: wraps at `messageWidth` and takes its height from the text.
+        width: .fixed(messageWidth),
+        expiry: .after(seconds: 2.5), severity: .warning, isMultiline: true)  // NotificationStyle 2.5
 
     case .error(let reason):
       // #2549: `.permissionDenied` gets the richer badge+title+subtitle+button
@@ -269,7 +269,8 @@ enum PillCatalog {
             localized: "Turn it on to start dictating.",
             comment: "Pill line under Microphone access needed."),
           accessibilityLabel: DictationNarrator.copy(for: reason),
-          width: .fixed(400), fixedHeight: 64,
+          // #3912: keeps its 400 width (badge and button) and takes its height from the text.
+          width: .fixed(400),  // was 400 x 64
           expiry: .after(seconds: 6), severity: .error, isMultiline: true,
           action: NoticeAction(
             label: String(
@@ -279,8 +280,8 @@ enum PillCatalog {
       }
       return notice(
         id: id, kind: .notification, text: DictationNarrator.copy(for: reason),
-        width: .fixed(280), fixedHeight: 44,
-        expiry: .after(seconds: 3), severity: .error)  // NotificationStyle 3.0
+        width: .fixed(messageWidth),
+        expiry: .after(seconds: 3), severity: .error, isMultiline: true)  // NotificationStyle 3.0
 
     case .advisory(let reason, let hint):
       // #1891. A user-setup advisory draws the mic-slash glyph in the secondary
@@ -306,26 +307,27 @@ enum PillCatalog {
     case .interruption(let reason):
       return notice(
         id: id, kind: .notification, text: DictationNarrator.copy(for: reason),
-        width: .fixed(280), fixedHeight: 44,
-        expiry: .after(seconds: 2), severity: .distress)  // NotificationStyle 2.0
+        width: .fixed(messageWidth),
+        expiry: .after(seconds: 2), severity: .distress, isMultiline: true)  // NotificationStyle 2.0
 
     case .passiveChip(let payload):
       return PillDefinition(
         id: id, content: .languageChip(payload: payload),
         expiry: .after(seconds: 6, pausesOnHover: true),
-        requestedWidth: .fixed(340), reservesFixedHeight: 56)  // :1410
+        // #3912: the sentence wraps and the chip grows taller; its buttons stay put.
+        requestedWidth: .fixed(340))  // :1410
 
     case .cachingModel(let engineLabel):
       return notice(
         id: id, kind: .warmingUp, text: DictationNarrator.coldStartTitle,
         secondary: DictationNarrator.coldStartSubtitle(engineLabel: engineLabel),
-        width: .fixed(300), fixedHeight: 56,  // :483
+        width: .fixed(messageWidth),  // #3912; was 300 x 56 (:483)
         expiry: .after(seconds: 2))  // :642
 
     case .engineReady:
       return notice(
         id: id, kind: .ready, text: DictationNarrator.readyTitle,
-        width: .fixed(240), fixedHeight: 44,  // :498
+        width: .fixed(messageWidth),  // #3912; was 240 x 44 (:498)
         expiry: .after(seconds: 1.5))  // :657
 
     case .recoveringLastRecording:
@@ -337,7 +339,7 @@ enum PillCatalog {
         // strings — the leaf used to read this constant itself, which is the
         // duplication this chunk removes.
         accessibilityLabel: DictationNarrator.recoveryAccessibilityLabel,
-        width: .fixed(320), fixedHeight: 56,  // :530
+        width: .fixed(messageWidth),  // #3912; was 320 x 56 (:530)
         // that site gives it a 6-second dwell. The first version said `.untilReplaced`,
         // which would have left the recovery pill on screen forever.
         expiry: .after(seconds: 6), isMultiline: true,
@@ -364,7 +366,7 @@ enum PillCatalog {
       return notice(
         id: id, kind: .ready, text: DictationNarrator.recoverySucceededTitle,
         secondary: DictationNarrator.recoverySucceededSubtitle,
-        width: .fixed(300), fixedHeight: 56,  // :516
+        width: .fixed(messageWidth),  // #3912; was 300 x 56 (:516)
         expiry: .after(seconds: 3))  // :675
 
     case .bluetoothAwareness:
@@ -383,7 +385,8 @@ enum PillCatalog {
         requestedWidth: .fixed(320))
 
     case .parakeetUpgrade(let model):
-      // #3546 A3: the cold-start pill's shape (300 x 56, title and subtitle). Downloading
+      // #3546 A3: the cold-start pill's shape (title and subtitle; #3912 wraps it at
+      // `messageWidth` with a content height, where it was 300 x 56). Downloading
       // stays six seconds while its progress line moves; installing waits for its replacement
       // (ready, or a dismissal when v3 serves again); ready leaves after three seconds, like
       // the recovery success pill.
@@ -395,7 +398,7 @@ enum PillCatalog {
       }
       return PillDefinition(
         id: id, content: .parakeetUpgrade(model), expiry: expiry,
-        requestedWidth: .fixed(300), reservesFixedHeight: 56)
+        requestedWidth: .fixed(messageWidth))
 
     case .correctionLearned(let model):
       // 2026-09-21 plan §3.1 step 9, widened to three seconds on 2026-09-22
@@ -475,6 +478,14 @@ enum PillCatalog {
   }
 
   // MARK: - Shared shape
+
+  /// **The widest a message pill gets, and it never stretches past it (#3912).**
+  /// Warnings, errors, interruptions and the two-line notices wrap at this width
+  /// and take their height from the text, so a long translation adds lines and
+  /// never ends in "…". A short message still draws its own compact capsule:
+  /// `OverlayRootView.contentWidthProposal(for:)` proposes the width, and the
+  /// leaf hugs its content inside it. Founder-approved design, 2026-10-17.
+  static let messageWidth: CGFloat = 320
 
   /// `fixedHeight` is the shipped `showPanel(height:)` for this notice, and
   /// omitting it means CONTENT-SIZED, which is what `fitToContent: true` does at

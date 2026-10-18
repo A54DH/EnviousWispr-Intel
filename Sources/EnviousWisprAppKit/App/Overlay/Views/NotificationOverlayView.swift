@@ -88,22 +88,24 @@ struct NotificationOverlayView: View {
 
       if isRich {
         VStack(alignment: .leading, spacing: 2) {
+          // #3912: both lines wrap at the pill's width; the pill grows taller.
           Text(message)
             .font(.system(size: 13, weight: .semibold))
             .foregroundStyle(.white)
+            .fixedSize(horizontal: false, vertical: true)
           if let secondaryText {
             Text(secondaryText)
               .font(.system(size: 12))
               .foregroundStyle(.white.opacity(0.65))
+              .fixedSize(horizontal: false, vertical: true)
           }
         }
       } else {
         Text(message)
           .font(.system(size: 13, weight: .medium))
           .foregroundStyle(style.usesDistressLips ? Color.orange : .white)
-          // #1891: `.lineLimit(1)` in a 280pt box truncates the advisory sentence
-          // to a fragment. Only the advisory wraps; every other notice keeps its
-          // single-line shape exactly as before.
+          // #1891, #3912: a message wraps at its pill's width rather than ending
+          // in "…". `isMultiline` is false only for a notice that must stay one line.
           .lineLimit(isMultiline ? nil : 1)
           .fixedSize(horizontal: false, vertical: isMultiline)
           .multilineTextAlignment(.leading)
