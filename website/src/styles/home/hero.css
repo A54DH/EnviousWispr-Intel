@@ -17,27 +17,25 @@
   background:
     linear-gradient(
       90deg,
-      var(--bg),
-      color-mix(in srgb, var(--bg) 70%, transparent) 27%,
-      transparent 48%
+      color-mix(in srgb, var(--bg) 62%, transparent),
+      color-mix(in srgb, var(--bg) 38%, transparent) 22%,
+      color-mix(in srgb, var(--bg) 10%, transparent) 42%,
+      transparent 55%
     ),
-    linear-gradient(0deg, var(--bg), transparent 15%);
+    linear-gradient(180deg, color-mix(in srgb, var(--bg) 40%, transparent), transparent 18%),
+    linear-gradient(0deg, var(--bg), color-mix(in srgb, var(--bg) 60%, transparent) 8%, transparent 16%);
   inset: 0;
   position: absolute;
   z-index: -1;
 }
 .screen-hero-content.wrap {
-  min-height: clamp(780px, 100svh, 980px);
   position: relative;
   width: min(1500px, calc(100% - 128px));
 }
 .screen-hero-copy {
-  padding: 205px 0 115px;
   position: relative;
-  width: 54%;
 }
 .screen-hero-copy h1 {
-  font-size: clamp(62px, 5.3vw, 96px);
   font-weight: 700;
   letter-spacing: -0.055em;
   line-height: 1.04;
@@ -80,17 +78,17 @@
   margin-top: 13px;
 }
 .hero-product-demo {
-  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
   border-radius: 20px;
-  max-width: 600px;
   padding-bottom: 9px;
-  position: absolute;
-  right: 0;
+  position: relative;
   scroll-margin-top: 112px;
-  top: 210px;
-  width: 40%;
+  width: 100%;
 }
 .hero-screen-frame {
+  -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
   background: #f7f2fcdd;
   border: 1px solid #d9c7eb88;
@@ -273,56 +271,62 @@ html[data-theme='dark'] .hero-screen-frame {
     transform: rotate(1turn);
   }
 }
+/* Desktop: copy on the left, the loop blown up on the right over the painted room. */
 @media (min-width: 1000px) {
-  .hero-product-demo {
-    transform: scale(0.67);
-    transform-origin: top right;
+  .screen-hero-content.wrap {
+    align-items: center;
+    display: grid;
+    gap: 56px;
+    grid-template-columns: minmax(0, 48fr) minmax(0, 52fr);
+    min-height: clamp(760px, calc(100svh - 56px), 1000px);
+    padding-block: 140px 64px;
   }
-}
-@media (min-width: 1000px) and (max-height: 780px) {
   .screen-hero-copy {
-    padding-bottom: 85px;
-    padding-top: 175px;
+    padding: 0;
+    width: auto;
   }
-  .hero-product-demo {
-    top: 178px;
-  }
-  .screen-hero-description {
-    font-size: 18px;
-  }
-  .screen-hero-category {
-    margin-top: 21px;
-  }
-  .screen-hero-download {
-    margin-top: 23px;
+  .screen-hero-copy h1 {
+    font-size: clamp(56px, 4.5vw, 84px);
+    text-wrap: balance;
   }
   .hero-screen-canvas {
-    height: 380px;
+    height: clamp(440px, 36vw, 580px);
   }
-  .screen-hero-values {
-    margin-top: 21px;
+  /* The app scenes are drawn small; enlarge the whole scene evenly for every app.
+     A transform behaves the same in every supported browser, unlike CSS zoom. */
+  .hero-screen-canvas .host-app {
+    height: calc(100% / var(--hero-zoom));
+    transform: scale(var(--hero-zoom));
+    transform-origin: 0 0;
+    width: calc(100% / var(--hero-zoom));
+  }
+  .hero-screen-canvas {
+    --hero-zoom: 1.15;
+  }
+}
+@media (min-width: 1300px) {
+  .hero-screen-canvas {
+    --hero-zoom: 1.3;
+  }
+}
+@media (min-width: 1600px) {
+  .hero-screen-canvas {
+    --hero-zoom: 1.45;
   }
 }
 @media (min-width: 1000px) and (max-width: 1190px) {
   .screen-hero-content.wrap {
+    gap: 36px;
     width: calc(100% - 72px);
   }
   .screen-hero-copy h1 {
-    font-size: 59px;
-  }
-  .screen-hero-copy {
-    width: 58%;
+    font-size: 52px;
   }
   .screen-hero-description {
     font-size: 18px;
-    max-width: 410px;
   }
   .screen-hero-category {
     font-size: 19px;
-  }
-  .hero-product-demo {
-    top: 240px;
-    width: 39%;
   }
   .hero-screen-canvas .gmail-inbox aside {
     width: 72px;
@@ -332,20 +336,6 @@ html[data-theme='dark'] .hero-screen-frame {
   }
   .hero-screen-canvas .gmail-top > span:last-child {
     display: none;
-  }
-}
-@media (min-width: 1200px) {
-  .hero-product-demo {
-    /* Short desktop screens need clearance above the backdrop laptop. */
-    top: 110px;
-    transform: scale(0.73);
-  }
-}
-@media (min-width: 1200px) and (min-height: 900px) {
-  .hero-product-demo {
-    /* Grow upward and leave a little more room above the laptop. */
-    top: 210px;
-    transform: translateY(-15%) scale(0.8);
   }
 }
 @media (max-width: 999px) {
@@ -372,24 +362,26 @@ html[data-theme='dark'] .hero-screen-frame {
     font-size: 20px;
     max-width: 560px;
   }
+  /* Narrow screens show the painted room (window, wall and desk) at the top of the hero. */
   .screen-hero-art {
-    background-position: 53% -115px;
-    background-size: auto 520px;
+    background-position: var(--hero-art-x) 0;
+    background-size: auto 100%;
     bottom: auto;
-    height: 350px;
-    mask-image: linear-gradient(transparent, #000 12%, #000 82%, transparent);
-    top: var(--intro-copy-height, 630px);
+    height: clamp(600px, 110vw, 940px);
+    mask-image: linear-gradient(#000 80%, transparent);
   }
   .screen-hero-shade {
-    display: none;
+    background: linear-gradient(
+        180deg,
+        color-mix(in srgb, var(--bg) var(--hero-veil-top), transparent),
+        color-mix(in srgb, var(--bg) var(--hero-veil-mid), transparent) 36%,
+        transparent 55%
+      ),
+      linear-gradient(0deg, var(--bg), transparent 10%);
   }
   .hero-product-demo {
-    margin: 320px auto 0;
+    margin: 40px auto 0;
     max-width: 680px;
-    position: relative;
-    right: auto;
-    top: auto;
-    width: 100%;
   }
   .hero-screen-canvas {
     height: 430px;
@@ -432,13 +424,8 @@ html[data-theme='dark'] .hero-screen-frame {
     font-size: 13px;
     margin-top: 10px;
   }
-  .screen-hero-art {
-    background-position: 53% -85px;
-    background-size: auto 440px;
-    height: 300px;
-  }
   .hero-product-demo {
-    margin-top: 280px;
+    margin-top: 32px;
   }
   .hero-screen-frame {
     border-radius: 17px;
@@ -709,5 +696,36 @@ html[data-theme='dark'] .screen-hero-art {
     html:not([data-theme]) .screen-hero-art {
       background-image: var(--hero-dark-0);
     }
+  }
+}
+
+/* Narrow screens follow the footer closing: the copy sits on the brightest part
+   of the painting under a light veil, with darker copy colors. Light shows the
+   pale wall and window frame behind the copy; dark shows the night window. */
+.screen-hero {
+  --hero-art-x: 30%;
+  --hero-veil-top: 35%;
+  --hero-veil-mid: 20%;
+  --hero-copy-body: #3f3150;
+}
+html[data-theme='dark'] .screen-hero {
+  --hero-art-x: 88%;
+  --hero-veil-top: 45%;
+  --hero-veil-mid: 25%;
+  --hero-copy-body: #e1d5ed;
+}
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme]) .screen-hero {
+    --hero-art-x: 88%;
+    --hero-veil-top: 45%;
+    --hero-veil-mid: 25%;
+    --hero-copy-body: #e1d5ed;
+  }
+}
+@media (max-width: 999px) {
+  .screen-hero-description,
+  .screen-hero-values span,
+  .screen-hero-compatibility {
+    color: var(--hero-copy-body);
   }
 }
