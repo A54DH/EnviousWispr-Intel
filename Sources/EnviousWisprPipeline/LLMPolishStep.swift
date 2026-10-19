@@ -26,6 +26,105 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
   public var s1Control: S1ControlSettings = .default
   public var polishVocabulary: PolishVocabulary = .empty
 
+  struct FileBatchMember {
+    let context: TextProcessingContext
+    fileprivate let provider: LLMProvider
+    fileprivate let model: String
+    fileprivate let config: LLMProviderConfig
+    fileprivate let system: String?
+    fileprivate let mode: PolishMode
+    fileprivate let vocabulary: PolishVocabulary
+    fileprivate let backend: ASRBackendType?
+  }
+
+  private struct FileBatchInput {
+    let id: UUID
+    let members: [FileBatchMember]
+    let text: String
+  }
+  private var fileBatchInput: FileBatchInput?
+  private var fileBatchOutput: (id: UUID, contexts: [TextProcessingContext])?
+  private var fileBatchConsumed = false
+
+  /// Inspection does not dispatch or emit bypass events. The existing prompt predicate
+  /// excludes short/minimal-edit inputs; their ordinary path owns any bypass notice.
+  func fileBatchMember(_ context: TextProcessingContext) -> FileBatchMember? {
+    // #2905 prepared-input checks found a lost speaker-leading word in GPT-4o mini
+    // batches and a changed source noun in Haiku 4.5, retained by matched ordinary
+    // requests. Keep these families, including dated aliases, on individual calls:
+    // valid section tags alone cannot establish that cleanup preserved meaning.
+    let model = llmModel.lowercased()
+    let keepsOrdinaryRequests =
+      (llmProvider == .openAI && model.hasPrefix("gpt-4o-mini"))
+      || (llmProvider == .claude && model.hasPrefix("claude-haiku-4-5"))
+    guard [.openAI, .gemini, .claude].contains(llmProvider),
+      keepsOrdinaryRequests == false,
+      DefaultPromptPlanner.cloudRequiresMinimalEdits(context.text) == false,
+      context.polishedText == nil, context.fileBatchCompletionID == nil,
+      context.polishWasBypassed == false
+    else { return nil }
+    let plan = promptPlan(
+      context: context, provider: llmProvider, model: llmModel, ollamaRemote: nil,
+      s1Control: s1Control, vocabularySnapshot: PromptVocabulary.fromLegacy(polishVocabulary.terms),
+      namedLanguage: nil)
+    guard plan.family == .cloudFixed, plan.envelope.messages.count == 2,
+      let pair = plan.envelope.asSingleTurn()
+    else { return nil }
+    return FileBatchMember(
+      context: context, provider: llmProvider, model: llmModel,
+      config: providerConfig(context: context, provider: llmProvider, model: llmModel, ollamaThinks: nil),
+      system: pair.system, mode: plan.mode, vocabulary: polishVocabulary, backend: backend)
+  }
+
+  private static func sameConfig(_ lhs: LLMProviderConfig, _ rhs: LLMProviderConfig) -> Bool {
+    lhs.model == rhs.model && lhs.apiKeyKeychainId == rhs.apiKeyKeychainId
+      && lhs.outputTokens == rhs.outputTokens && lhs.temperature == rhs.temperature
+      && lhs.thinking == rhs.thinking && lhs.detectedLanguage == rhs.detectedLanguage
+  }
+
+  /// Pure compatibility query for incremental packing; prepare uses the same decision.
+  func canShareFileBatch(_ members: [FileBatchMember]) -> Bool {
+    guard members.count > 1,
+      let first = members.first, let own = fileBatchMember(first.context),
+      own.provider == first.provider, own.model == first.model,
+      own.system == first.system, Self.sameConfig(own.config, first.config),
+      own.vocabulary == first.vocabulary, own.backend == first.backend,
+      members.allSatisfy({ member in
+        member.provider == first.provider && member.model == first.model
+          && Self.sameConfig(member.config, first.config) && member.system == first.system
+          && member.vocabulary == first.vocabulary && member.backend == first.backend
+          && member.context.language == first.context.language
+          && member.context.languageSource == first.context.languageSource
+      })
+    else { return false }
+    return true
+  }
+
+  /// A fresh group step accepts only members with identical existing instruction/config policy.
+  /// nil asks the caller to use ordinary processing, with no cloud request made here.
+  func prepareFileBatch(_ members: [FileBatchMember]) -> TextProcessingContext? {
+    guard fileBatchConsumed == false, fileBatchInput == nil, fileBatchOutput == nil,
+      canShareFileBatch(members), let first = members.first
+    else { return nil }
+    let text = SectionEnvelope.wrap(members.map { $0.context.text })
+    let batch = FileBatchInput(id: UUID(), members: members, text: text)
+    fileBatchInput = batch
+    var context = first.context
+    context.text = text
+    context.polishedText = nil
+    context.fileBatchCompletionID = nil
+    return context
+  }
+
+  /// Consume once, and only when the shared timed runner accepted this invocation's receipt.
+  func takeFileBatchResults(accepted context: TextProcessingContext) -> [TextProcessingContext]? {
+    defer { fileBatchConsumed = true; fileBatchInput = nil; fileBatchOutput = nil }
+    guard fileBatchConsumed == false, let input = fileBatchInput, let output = fileBatchOutput,
+      context.fileBatchCompletionID == input.id, output.id == input.id
+    else { return nil }
+    return output.contexts
+  }
+
   // MARK: - Multilingual v1 (W3)
 
   /// Language detection outcome from the autodetect stack. Set by
@@ -662,60 +761,9 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
     return ctx
   }
 
-  /// #3438: WHEN this step observed what the setup warnings care about, stamped where it was
-  /// observed: Ollama's own check answered (`probeAnsweredAt`); the request was handed to the
-  /// connector, which reads the saved key first (`requestStartedAt`); the provider answered or
-  /// refused (`requestEndedAt`). Reset at every `process` so one take never reads another's.
-  struct SetupObservation: Equatable {
-    var probeAnsweredAt: ContinuousClock.Instant?
-    var requestStartedAt: ContinuousClock.Instant?
-    var requestEndedAt: ContinuousClock.Instant?
-  }
-  private(set) var setupObservation = SetupObservation()
-
-  public func process(_ context: TextProcessingContext) async throws -> TextProcessingContext {
-    setupObservation = SetupObservation()
-    // #3105: every caller (live take, file-import part, re-polish, recovery
-    // replay) holds the bundled server through the actual inference. A live
-    // take deliberately takes no hold at recording start: that would put an
-    // actor hop on the heart path before audio. A server change during the
-    // recording is answered here, as the limb's existing skip. A file import
-    // also holds for its whole run (`LocalPolishRuntimeSet.holdForImport`).
-    var inferenceLease: (runtime: any EGOneLeaseProviding, lease: LocalPolishServerLease)?
-    defer {
-      if let inferenceLease {
-        Task { await inferenceLease.runtime.releaseLocalServerLease(inferenceLease.lease) }
-      }
-    }
-    onWillProcess?()
-    // #827 PR-8: snapshot the mutable provider/model at entry. process()
-    // suspends at the polish await, so every read after it must come from
-    // these locals or the post-await reads could tear
-    // (provider/model attribution in ctx, the family label, and the two
-    // telemetry helpers). Mirrors WordCorrectionStep's entry snapshot. Every
-    // read below uses these locals, never `self`, so reentrancy cannot tear it.
-    let provider = llmProvider
-    let model = llmModel
-    // Separate from usage telemetry: import/recovery's silent seam must not hide a crash.
-    let diagnosticOperation = SentryBreadcrumb.beginPolishOperation(provider: provider, model: model)
-    defer { SentryBreadcrumb.endPolishOperation(diagnosticOperation) }
-    let s1Control = s1Control
-    // #3195: claimed here, before the first suspension, so the session prepared for
-    // this take is used at most once. A `${transcript}` template never uses it.
-    let claimedAFMSession: (any Sendable)? = {
-      let claimed = claimAFMPrewarm(takeID: context.takeID)
-      guard provider == .appleIntelligence,
-        !polishInstructions.systemPrompt.contains("${transcript}")
-      else { return nil }
-      return claimed
-    }()
-    telemetry.breadcrumbStarted(
-      "LLM polish started",
-      [
-        "provider": provider.rawValue,
-        "model": model,
-      ])
-
+  func bypassIfTooShort(
+    _ context: TextProcessingContext, provider: LLMProvider
+  ) -> TextProcessingContext? {
     // Short-circuit: ultra-short transcripts get passed through verbatim.
     // LLMs treat 1-3 word inputs as prompts to respond to, not text to clean.
     // Language-aware: CJK/Thai/Lao scripts use char-count since they don't
@@ -758,6 +806,66 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
         return Self.bypassedContext(context)
       }
     }
+
+    return nil
+  }
+
+  /// #3438: WHEN this step observed what the setup warnings care about, stamped where it was
+  /// observed: Ollama's own check answered (`probeAnsweredAt`); the request was handed to the
+  /// connector, which reads the saved key first (`requestStartedAt`); the provider answered or
+  /// refused (`requestEndedAt`). Reset at every `process` so one take never reads another's.
+  struct SetupObservation: Equatable {
+    var probeAnsweredAt: ContinuousClock.Instant?
+    var requestStartedAt: ContinuousClock.Instant?
+    var requestEndedAt: ContinuousClock.Instant?
+  }
+  private(set) var setupObservation = SetupObservation()
+
+  public func process(_ context: TextProcessingContext) async throws -> TextProcessingContext {
+    let fileBatchInput = self.fileBatchInput
+    setupObservation = SetupObservation()
+    // #3105: every caller (live take, file-import part, re-polish, recovery
+    // replay) holds the bundled server through the actual inference. A live
+    // take deliberately takes no hold at recording start: that would put an
+    // actor hop on the heart path before audio. A server change during the
+    // recording is answered here, as the limb's existing skip. A file import
+    // also holds for its whole run (`LocalPolishRuntimeSet.holdForImport`).
+    var inferenceLease: (runtime: any EGOneLeaseProviding, lease: LocalPolishServerLease)?
+    defer {
+      if let inferenceLease {
+        Task { await inferenceLease.runtime.releaseLocalServerLease(inferenceLease.lease) }
+      }
+    }
+    onWillProcess?()
+    // #827 PR-8: snapshot the mutable provider/model at entry. process()
+    // suspends at the polish await, so every read after it must come from
+    // these locals or the post-await reads could tear
+    // (provider/model attribution in ctx, the family label, and the two
+    // telemetry helpers). Mirrors WordCorrectionStep's entry snapshot. Every
+    // read below uses these locals, never `self`, so reentrancy cannot tear it.
+    let provider = llmProvider
+    let model = llmModel
+    // Separate from usage telemetry: import/recovery's silent seam must not hide a crash.
+    let diagnosticOperation = SentryBreadcrumb.beginPolishOperation(provider: provider, model: model)
+    defer { SentryBreadcrumb.endPolishOperation(diagnosticOperation) }
+    let s1Control = s1Control
+    // #3195: claimed here, before the first suspension, so the session prepared for
+    // this take is used at most once. A `${transcript}` template never uses it.
+    let claimedAFMSession: (any Sendable)? = {
+      let claimed = claimAFMPrewarm(takeID: context.takeID)
+      guard provider == .appleIntelligence,
+        !polishInstructions.systemPrompt.contains("${transcript}")
+      else { return nil }
+      return claimed
+    }()
+    telemetry.breadcrumbStarted(
+      "LLM polish started",
+      [
+        "provider": provider.rawValue,
+        "model": model,
+      ])
+
+    if let bypassed = bypassIfTooShort(context, provider: provider) { return bypassed }
 
     Task {
       await AppLogger.shared.log(
@@ -906,57 +1014,10 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
       throw LLMError.providerUnavailable
     }
 
-    let keychainId: String? =
-      switch provider {
-      case .openAI: KeychainManager.openAIKeyID
-      case .gemini: KeychainManager.geminiKeyID
-      case .claude: KeychainManager.claudeKeyID
-      // #2651: enumerated rather than `default:`. These providers hold no API
-      // key, so nil is the true answer. A NEW key-carrying provider reaching a
-      // `default:` would silently send no key.
-      case .ollama, .appleIntelligence, .egOne, .s1Mini, .none: nil
-      }
-
-    // Resolved from the ENTRY snapshot, never from `self` — this function's
-    // own contract above ("every read below uses these locals") applies to the
-    // thinking value too, so the request, the deadline and the telemetry all
-    // describe one model. (#1770 verified that no production code mutates
-    // these three on a live step: PipelineSettingsSync no-ops all of them and
-    // the values are frozen per recording. The discipline is kept because
-    // internal consistency should not depend on an invariant held elsewhere.)
-    //
-    // #1914: Ollama is the one provider whose thinking answer is OBSERVED per
-    // attempt rather than looked up. `LLMModelCapabilities` is documented
-    // "Static knowledge, deliberately" and keys off a model NAME, so a live
-    // `/api/tags` fact has no business in it — the daemon's answer is routed
-    // straight from the attempt's facts to the request instead. Every other
-    // provider keeps the static resolution unchanged.
-    let thinking: ResolvedThinking? =
-      provider == .ollama
-      ? Self.ollamaThinking(thinks: ollamaThinks)
-      : Self.resolveThinking(
-        control: provider.modelCapabilities(model: model).thinkingControl
-      )
-    let outputTokens = Self.outputTokenPolicy(
-      provider: provider, textCount: context.text.count,
-      thinks: ollamaThinks)
-
-    // Prefer live LID but fall back to the context's persisted language so
-    // standalone callers that clear `languageDetection` (crash-recovery's
-    // `RecoveryTextProcessor`, #1063) still hit the Apple Intelligence preflight
-    // gate and language-aware prompt. LOAD-BEARING — do not remove this fallback
-    // (the only previous caller was the deleted re-polish service, but recovery
-    // relies on the same path).
-    let detectedLanguage = languageDetection?.lang ?? context.language
-
-    let config = LLMProviderConfig(
-      model: model,
-      apiKeyKeychainId: keychainId,
-      outputTokens: outputTokens,
-      temperature: 0,
-      thinking: thinking,
-      detectedLanguage: detectedLanguage
-    )
+    let config = providerConfig(
+      context: context, provider: provider, model: model, ollamaThinks: ollamaThinks)
+    let outputTokens = config.outputTokens
+    let thinking = config.thinking
 
     // #1710 request-shape receipt for Live UAT: policy only, never content.
     // #1770 makes the DIALECT visible here — which wire key we chose, not just
@@ -1061,42 +1122,30 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
       }
     }
 
-    let input = PromptBuildInput(
-      transcript: context.text,
-      provider: provider,
-      modelID: model,
-      appName: context.targetAppName,
-      // #2614: the builders' contract is "populated ONLY when the session
-      // language is locked" (`CloudFixedPromptBuilder.swift`,
-      // `LocalFixedPromptBuilder.swift`). The context now carries a RESOLVED
-      // language, so pass it through only for a lock — or for a legacy context
-      // that never went through the resolver (`languageSource == nil`), where
-      // `language` still means the lock. The unconditional no-translate rule
-      // already covers Automatic.
-      language: context.languageSource == nil || context.languageSource == .locked
-        ? context.language : nil,
-      polishVocabulary: polishVocabulary,
-      focusSnapshot: nil,  // PR 3
-      customVocabulary: vocabularySnapshot,
-      languageDetection: languageDetection,
-      backend: backend,
-      // #1948: the daemon-reported execution location decides which Ollama prompt is sent.
-      // Already captured for this attempt at the readiness probe above; nil for every
-      // non-Ollama provider, which routes nothing.
-      ollamaIsRemote: ollamaRemote,
-      s1Control: s1Control,
-      // #3111: native EG-1 only, and only when the raw text itself names a measured
-      // language that no lock or engine answer contradicts. Nil sends today's prompt.
-      namedLanguage: egOneDecision?.namedLanguage
-    )
-    let plan = promptPlanner.plan(input: input)
+    let plan = promptPlan(
+      context: context, provider: provider, model: model, ollamaRemote: ollamaRemote,
+      s1Control: s1Control, vocabularySnapshot: vocabularySnapshot,
+      namedLanguage: egOneDecision?.namedLanguage)
+    let envelope: PromptEnvelope
+    if let batch = fileBatchInput {
+      guard provider == batch.members[0].provider, model == batch.members[0].model,
+        context.text == batch.text, context.fileBatchCompletionID == nil,
+        Self.sameConfig(config, batch.members[0].config),
+        plan.family == .cloudFixed,
+        plan.envelope.asSingleTurn()?.system == batch.members[0].system
+      else { throw LLMError.requestFailed("Incompatible file cleanup batch") }
+      envelope = PromptEnvelope(messages: plan.envelope.messages.map { message in
+        PromptMessage(role: message.role, content: message.content
+          + (message.role == .system ? SectionEnvelope.addendum(count: batch.members.count) : ""))
+      })
+    } else { envelope = plan.envelope }
 
     // #1948 content-free routing receipt. `prompt_family` otherwise exists only inside the
     // Sentry breadcrumb below, which Live UAT cannot read — so without this line the UAT
     // verdict for "did this model get the right prompt" is unobservable. Policy and sizes
     // only, never transcript or prompt content.
     let systemChars =
-      plan.envelope.messages.first(where: { $0.role == .system })?.content.count ?? 0
+      envelope.messages.first(where: { $0.role == .system })?.content.count ?? 0
     // #2649: the control line is three closed-enum policy values, never content,
     // and it is the only way Live UAT can see which picks reached the model.
     // Logged only for the family that reads it, so other engines' lines do not
@@ -1129,7 +1178,7 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
     setupObservation.requestStartedAt = .now
     do {
       result = try await polisher.polish(
-        envelope: plan.envelope,
+        envelope: envelope,
         config: config,
         onToken: onToken
       )
@@ -1156,14 +1205,6 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
         "prompt_family": plan.family.rawValue,
       ])
 
-    let validation = validatePolishOutput(
-      polished: result.polishedText,
-      original: context.text,
-      mode: plan.mode,
-      provider: provider, model: model
-    )
-    let validatedText = validation.text
-
     // #2093: the round trip completed, so this (provider, model) is warm and the
     // next take inside the window needs no warm-up request. Without this call
     // the gate in `LLMNetworkSession` could only ever be satisfied by a warm-up
@@ -1176,6 +1217,151 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
     // timeout, empty response) exits before here and records nothing.
     // `recordPolishSuccess` itself ignores providers whose policy is `.never`.
     LLMNetworkSession.shared.recordPolishSuccess(provider: provider, model: model)
+
+    if let batch = fileBatchInput {
+      guard let sections = SectionEnvelope.unwrap(result.polishedText, expected: batch.members.count)
+      else { throw LLMError.requestFailed("Invalid file cleanup section mapping") }
+      let contexts = zip(batch.members, sections).map { member, text in
+        finishResult(
+          LLMResult(polishedText: text, polishMetadata: result.polishMetadata),
+          context: member.context, mode: member.mode, provider: provider, model: model,
+          ollamaRemote: nil, family: .cloudFixed, policy: .batchPiece)
+      }
+      fileBatchOutput = (batch.id, contexts)
+      var completed = context
+      completed.fileBatchCompletionID = batch.id
+      return completed
+    }
+
+    return finishResult(
+      result, context: context, mode: plan.mode, provider: provider, model: model,
+      ollamaRemote: ollamaRemote, family: plan.family)
+  }
+
+  private func promptPlan(
+    context: TextProcessingContext, provider: LLMProvider, model: String,
+    ollamaRemote: Bool?, s1Control: S1ControlSettings, vocabularySnapshot: PromptVocabulary,
+    namedLanguage: String?
+  ) -> PolishPlan {
+    let input = PromptBuildInput(
+      transcript: context.text,
+      provider: provider,
+      modelID: model,
+      appName: context.targetAppName,
+      // #2614: the builders' contract is "populated ONLY when the session
+      // language is locked" (`CloudFixedPromptBuilder.swift`,
+      // `LocalFixedPromptBuilder.swift`). The context now carries a RESOLVED
+      // language, so pass it through only for a lock — or for a legacy context
+      // that never went through the resolver (`languageSource == nil`), where
+      // `language` still means the lock. The unconditional no-translate rule
+      // already covers Automatic.
+      language: context.languageSource == nil || context.languageSource == .locked
+        ? context.language : nil,
+      polishVocabulary: polishVocabulary,
+      focusSnapshot: nil,  // PR 3
+      customVocabulary: vocabularySnapshot,
+      languageDetection: languageDetection,
+      backend: backend,
+      // #1948: the daemon-reported execution location decides which Ollama prompt is sent.
+      // Already captured for this attempt at the readiness probe above; nil for every
+      // non-Ollama provider, which routes nothing.
+      ollamaIsRemote: ollamaRemote,
+      s1Control: s1Control,
+      // #3111: native EG-1 only, and only when the raw text itself names a measured
+      // language that no lock or engine answer contradicts. Nil sends today's prompt.
+      namedLanguage: namedLanguage
+    )
+    return promptPlanner.plan(input: input)
+
+  }
+
+  private func providerConfig(
+    context: TextProcessingContext, provider: LLMProvider, model: String, ollamaThinks: Bool?
+  ) -> LLMProviderConfig {
+    let keychainId: String? =
+      switch provider {
+      case .openAI: KeychainManager.openAIKeyID
+      case .gemini: KeychainManager.geminiKeyID
+      case .claude: KeychainManager.claudeKeyID
+      // #2651: enumerated rather than `default:`. These providers hold no API
+      // key, so nil is the true answer. A NEW key-carrying provider reaching a
+      // `default:` would silently send no key.
+      case .ollama, .appleIntelligence, .egOne, .s1Mini, .none: nil
+      }
+
+    // Resolved from the ENTRY snapshot, never from `self` — this function's
+    // own contract above ("every read below uses these locals") applies to the
+    // thinking value too, so the request, the deadline and the telemetry all
+    // describe one model. (#1770 verified that no production code mutates
+    // these three on a live step: PipelineSettingsSync no-ops all of them and
+    // the values are frozen per recording. The discipline is kept because
+    // internal consistency should not depend on an invariant held elsewhere.)
+    //
+    // #1914: Ollama is the one provider whose thinking answer is OBSERVED per
+    // attempt rather than looked up. `LLMModelCapabilities` is documented
+    // "Static knowledge, deliberately" and keys off a model NAME, so a live
+    // `/api/tags` fact has no business in it — the daemon's answer is routed
+    // straight from the attempt's facts to the request instead. Every other
+    // provider keeps the static resolution unchanged.
+    let thinking: ResolvedThinking? =
+      provider == .ollama
+      ? Self.ollamaThinking(thinks: ollamaThinks)
+      : Self.resolveThinking(
+        control: provider.modelCapabilities(model: model).thinkingControl
+      )
+    let outputTokens = Self.outputTokenPolicy(
+      provider: provider, textCount: context.text.count,
+      thinks: ollamaThinks)
+
+    // Prefer live LID but fall back to the context's persisted language so
+    // standalone callers that clear `languageDetection` (crash-recovery's
+    // `RecoveryTextProcessor`, #1063) still hit the Apple Intelligence preflight
+    // gate and language-aware prompt. LOAD-BEARING — do not remove this fallback
+    // (the only previous caller was the deleted re-polish service, but recovery
+    // relies on the same path).
+    let detectedLanguage = languageDetection?.lang ?? context.language
+
+    return LLMProviderConfig(
+      model: model,
+      apiKeyKeychainId: keychainId,
+      outputTokens: outputTokens,
+      temperature: 0,
+      thinking: thinking,
+      detectedLanguage: detectedLanguage
+    )
+
+  }
+
+  /// Ordinary calls keep their existing validation. File-batch pieces omit only the
+  /// length heuristics rejected for batching; this is not a semantic quality judge.
+  enum ResultPolicy: Equatable { case ordinary, batchPiece }
+
+  func finishResult(
+    _ result: LLMResult, context: TextProcessingContext, mode: PolishMode,
+    provider: LLMProvider, model: String, ollamaRemote: Bool?, family: PromptFamily,
+    policy: ResultPolicy = .ordinary
+  ) -> TextProcessingContext {
+    if policy == .batchPiece,
+      result.polishedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      // The request ran but this piece has no usable answer. Keep its prepared floor,
+      // without claiming a bypass or a successful per-piece polish.
+      var ctx = Self.bypassedContext(context)
+      ctx.polishWasBypassed = false
+      ctx.polishMetadata = nil
+      ctx.pipelineFellBackToRaw = false
+      ctx.polishFallbackReason = nil
+      ctx.polishValidatorGuard = nil
+      ctx.symbolTokens = nil
+      return ctx
+    }
+    let validation = validatePolishOutput(
+      polished: result.polishedText,
+      original: context.text,
+      mode: mode,
+      provider: provider, model: model, policy: policy
+    )
+    let validatedText = validation.text
 
     var ctx = context
     ctx.polishedText = validatedText
@@ -1206,7 +1392,7 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
     // above.
     ctx.polishRanRemote = ollamaRemote
     // #1948: same stamp site, same reasoning — set only after a real polish returned.
-    ctx.promptFamily = plan.family
+    ctx.promptFamily = family
     return ctx
   }
 
@@ -1294,68 +1480,71 @@ public final class LLMPolishStep: TextProcessingStep, PolishVocabularyConsumer {
   /// slash or backslash token the deterministic text carried.
   func validatePolishOutput(
     polished: String, original: String, mode: PolishMode,
-    provider: LLMProvider, model: String
+    provider: LLMProvider, model: String, policy: ResultPolicy = .ordinary
   ) -> PolishValidation {
     guard !original.isEmpty else {
       return PolishValidation(text: polished, guardName: nil, symbolTokens: nil)
     }
 
-    // Mode-aware thresholds (from plan Appendix C).
-    //
-    // #1948: ONLY `.message` is reachable in production. `DefaultPromptPlanner` forces it for
-    // every family now that `TranscriptAnalyzer` is deleted, and the Apple Intelligence path
-    // passes `.message` literally (`:648`), so `.inline` / `.structured` / `.edit` are inert.
-    // They are kept rather than deleted because `PolishMode` is a public Core type and the
-    // switch must stay exhaustive — not because a caller still selects them. The cost of
-    // moving the former `.structured` inputs onto `.message` thresholds was measured before
-    // the change rather than assumed: +11 extra fallbacks of 1,690 on `qwen2.5:3b`, +6 on
-    // `llama3.2`. If you are here to tune a threshold, tune `.message`; the others describe
-    // transcript shapes nothing classifies any more.
-    let expansionThreshold: Int
-    let contentDropFraction: (numerator: Int, denominator: Int)
-    switch mode {
-    case .inline:
-      expansionThreshold = max(original.count * 3, 150)
-      contentDropFraction = (2, 5)  // 40% retention minimum
-    case .message:
-      expansionThreshold = max(original.count * 3, 200)
-      contentDropFraction = (2, 5)
-    case .structured:
-      expansionThreshold = max(original.count * 4, 300)
-      contentDropFraction = (1, 3)  // 33% retention minimum (more aggressive cleanup ok)
-    case .edit:
-      expansionThreshold = max(original.count * 4, 300)
-      contentDropFraction = (1, 3)
-    }
-
-    // Guard 1: Expansion hallucination
-    if polished.count > expansionThreshold {
-      Task {
-        await AppLogger.shared.log(
-          "LLM polish validator: expansion \(polished.count)/\(original.count) chars "
-            + "exceeds \(expansionThreshold) (mode=\(mode.rawValue)) — falling back "
-            + "(provider=\(provider.rawValue), model=\(model))",
-          level: .info, category: "LLM"
-        )
+    if policy == .ordinary {
+      // Mode-aware thresholds (from plan Appendix C).
+      //
+      // #1948: ONLY `.message` is reachable in production. `DefaultPromptPlanner` forces it for
+      // every family now that `TranscriptAnalyzer` is deleted, and the Apple Intelligence path
+      // passes `.message` literally (`:648`), so `.inline` / `.structured` / `.edit` are inert.
+      // They are kept rather than deleted because `PolishMode` is a public Core type and the
+      // switch must stay exhaustive — not because a caller still selects them. The cost of
+      // moving the former `.structured` inputs onto `.message` thresholds was measured before
+      // the change rather than assumed: +11 extra fallbacks of 1,690 on `qwen2.5:3b`, +6 on
+      // `llama3.2`. If you are here to tune a threshold, tune `.message`; the others describe
+      // transcript shapes nothing classifies any more.
+      let expansionThreshold: Int
+      let contentDropFraction: (numerator: Int, denominator: Int)
+      switch mode {
+      case .inline:
+        expansionThreshold = max(original.count * 3, 150)
+        contentDropFraction = (2, 5)  // 40% retention minimum
+      case .message:
+        expansionThreshold = max(original.count * 3, 200)
+        contentDropFraction = (2, 5)
+      case .structured:
+        expansionThreshold = max(original.count * 4, 300)
+        contentDropFraction = (1, 3)  // 33% retention minimum (more aggressive cleanup ok)
+      case .edit:
+        expansionThreshold = max(original.count * 4, 300)
+        contentDropFraction = (1, 3)
       }
-      return PolishValidation(text: original, guardName: "expansion", symbolTokens: nil)
-    }
 
-    // Guard 2: Content drop
-    let originalWords = original.split(whereSeparator: \.isWhitespace)
-    let polishedWords = polished.split(whereSeparator: \.isWhitespace)
-    let dropThreshold =
-      (originalWords.count * contentDropFraction.numerator + contentDropFraction.denominator - 1)
-      / contentDropFraction.denominator
-    if originalWords.count >= 10 && polishedWords.count < dropThreshold {
-      Task {
-        await AppLogger.shared.log(
-          "LLM polish validator: content drop \(polishedWords.count)/\(originalWords.count) words "
-            + "(mode=\(mode.rawValue)) — falling back (provider=\(provider.rawValue), model=\(model))",
-          level: .info, category: "LLM"
-        )
+      // Guard 1: Expansion hallucination
+      if polished.count > expansionThreshold {
+        Task {
+          await AppLogger.shared.log(
+            "LLM polish validator: expansion \(polished.count)/\(original.count) chars "
+              + "exceeds \(expansionThreshold) (mode=\(mode.rawValue)) — falling back "
+              + "(provider=\(provider.rawValue), model=\(model))",
+            level: .info, category: "LLM"
+          )
+        }
+        return PolishValidation(text: original, guardName: "expansion", symbolTokens: nil)
       }
-      return PolishValidation(text: original, guardName: "content_drop", symbolTokens: nil)
+
+      // Guard 2: Content drop
+      let originalWords = original.split(whereSeparator: \.isWhitespace)
+      let polishedWords = polished.split(whereSeparator: \.isWhitespace)
+      let dropThreshold =
+        (originalWords.count * contentDropFraction.numerator + contentDropFraction.denominator - 1)
+        / contentDropFraction.denominator
+      if originalWords.count >= 10 && polishedWords.count < dropThreshold {
+        Task {
+          await AppLogger.shared.log(
+            "LLM polish validator: content drop \(polishedWords.count)/\(originalWords.count) words "
+              + "(mode=\(mode.rawValue)) — falling back (provider=\(provider.rawValue), model=\(model))",
+            level: .info, category: "LLM"
+          )
+        }
+        return PolishValidation(text: original, guardName: "content_drop", symbolTokens: nil)
+      }
+
     }
 
     // Guard 3: Question-to-answer conversion (unchanged across modes)
