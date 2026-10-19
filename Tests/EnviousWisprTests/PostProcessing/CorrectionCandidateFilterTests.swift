@@ -292,4 +292,43 @@ import Testing
     #expect(disposition(run("Pay Pal", "PayPal"), inputs()) == .candidate(.newWord))
     #expect(disposition(run("day toast", "Tuist"), inputs()) == .candidate(.newWord))
   }
+
+  @Test(
+    "a fix that removes single letters in separate places reaches the judge; two or more letters gone from one place stay unfinished (#3949)",
+    .bug("https://github.com/saurabhav88/EnviousWispr/issues/3949", "a fix that only removes letters is never learned"))
+  func scatteredSingleLetterDeletionReachesTheJudge() {
+    // Founder 2026-10-19: "Whisper Eyes" -> "WisprEyes" drops `h` and `e` at two
+    // spots; this shape reaches the judge under the founder's rule.
+    for (original, corrected) in [
+      ("Whisper Eyes", "WisprEyes"), ("Whisper", "Wispr"), ("Flicker Tumbler", "Flickr Tumblr"),
+      // Only some readings scatter: "baab" -> "ba" keeps b, a and drops the
+      // other a and the last b apart. A left-to-right first match would read
+      // one "ab" chunk and block it.
+      ("baab", "ba"),
+    ] {
+      #expect(
+        disposition(run(original, corrected), inputs()) == .candidate(.newWord),
+        "\(original) -> \(corrected)")
+    }
+    // Every reading removes 2 or more letters in one place: what backspacing
+    // leaves, so it stays unfinished even when other letters went elsewhere.
+    for (original, corrected) in [
+      ("Whisper Eyes", "WisprEs"), ("microphoness", "microphone"), ("abab", "ab"),
+    ] {
+      #expect(
+        disposition(run(original, corrected), inputs()) == .ineligible(.unfinishedEdit),
+        "\(original) -> \(corrected)")
+    }
+    // The alignment search is quadratic, so it runs only up to
+    // `maxSimilarityChars`; past it the #3105 answer stands. Both rows drop
+    // the first and last letter, which scatters.
+    #expect(F.maxSimilarityChars == 200)
+    let atCap = String(repeating: "ab", count: 100)
+    let overCap = atCap + "a"
+    #expect(
+      disposition(run(atCap, String(atCap.dropFirst().dropLast())), inputs()) == .candidate(.newWord))
+    #expect(
+      disposition(run(overCap, String(overCap.dropFirst().dropLast())), inputs())
+        == .ineligible(.unfinishedEdit))
+  }
 }
