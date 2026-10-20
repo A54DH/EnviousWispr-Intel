@@ -19,6 +19,18 @@ set -euo pipefail
 # Usage: ./scripts/build-dev-app.sh   (no arguments)
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The script owns its full log, inside THIS checkout's ignored build/, so callers
+# never redirect output somewhere of their own and the log dies with the worktree.
+# stdout and stderr each keep their stream; both are appended to one file.
+# Set up before the helpers are sourced, so a broken helper still leaves a log.
+# Only the newest 20 dev-build logs are kept.
+DEV_BUILD_LOG_DIR="$PROJECT_ROOT/build/logs"
+mkdir -p "$DEV_BUILD_LOG_DIR"
+DEV_BUILD_LOG="$DEV_BUILD_LOG_DIR/dev-app-$(date +%Y%m%d-%H%M%S)-$$.log"
+{ ls -1t "$DEV_BUILD_LOG_DIR"/dev-app-*.log 2>/dev/null || true; } | tail -n +20 \
+  | while IFS= read -r old_log; do rm -f -- "$old_log"; done
+exec > >(tee -a "$DEV_BUILD_LOG") 2> >(tee -a "$DEV_BUILD_LOG" >&2)
+echo "==> Full log: $DEV_BUILD_LOG"
 # #2157 chunk C: shared owner for conditional project generation. Sourced from
 # THIS worktree, never the main checkout — `scripts/` is tracked, so every
 # checkout has its own copy and each must generate its OWN project.
@@ -260,4 +272,5 @@ elif [ "$_launch_rc" -ne 0 ]; then
 fi
 # LAUNCH-HANDLER-END
 echo "==> EnviousWispr (dev) running ✓  ($APP_PATH)"
+echo "    Full log: $DEV_BUILD_LOG"
 echo "    This session holds the dev app until it runs: python3 $DEV_APP_LOCK release"
